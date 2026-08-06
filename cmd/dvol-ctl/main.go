@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"text/tabwriter"
 
 	"github.com/fabio/dvol/pkg/dvol"
@@ -120,13 +119,7 @@ func runBackups(store *dvol.Store, name string) {
 // resolveBackup returns the archive path: an exact/glob path, or a filename
 // (exact or glob) resolved against backups/<volume>/.
 func resolveBackup(store *dvol.Store, name, arg string) (string, error) {
-	if matches, err := filepath.Glob(arg); err == nil && len(matches) == 1 {
-		return matches[0], nil
-	}
-	if matches, err := filepath.Glob(filepath.Join(store.BackupsDir(name), arg)); err == nil && len(matches) == 1 {
-		return matches[0], nil
-	}
-	return "", fmt.Errorf("no backup matching %q for volume %q", arg, name)
+	return store.ResolveBackup(name, arg)
 }
 
 func humanSize(n int64) string {

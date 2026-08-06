@@ -31,11 +31,12 @@ and restored from them.
 ## Layout
 
 ```
-cmd/dvol-plugin   volume driver daemon (plugin entrypoint)
-cmd/dvol-ctl      host CLI: create/rm/list/backup/restore/backups
-pkg/dvol          core library: volume store + tar.gz backup/restore
-plugin/           config.json manifest + Dockerfile for the rootfs
-test/e2e.sh       end-to-end smoke test over dvol-ctl
+cmd/dvol-plugin       volume driver daemon (plugin entrypoint)
+cmd/dvol-ctl          host CLI: create/rm/list/backup/restore/backups
+cmd/dvol-cli-plugin   docker CLI plugin `docker dvol` (+ compose backup/restore)
+pkg/dvol              core library: volume store + tar.gz backup/restore + compose parsing
+plugin/               config.json manifest + Dockerfile for the rootfs
+test/e2e.sh           end-to-end smoke test over dvol-ctl
 ```
 
 ## Build & test
@@ -81,7 +82,39 @@ dvol-ctl backups app               # list archives
 dvol-ctl restore app <name|path>   # restore latest (glob or exact name)
 ```
 
-Scheduled backups are supported by calling `dvol-ctl backup` from cron, e.g.:
+### From inside Docker: the `docker dvol` CLI plugin
+
+Install the companion CLI plugin and use the dvol volumes directly from the
+`docker` command (requires the `dvol` volume driver plugin, or the store at
+`/var/lib/dvol`):
+
+```
+make cli-plugin-install     # -> ~/.docker/cli-plugins/docker-dvol
+docker dvol list
+docker dvol backup app db data1,data2
+docker dvol restore app db
+docker dvol backups app
+```
+
+### Compose-aware backups
+
+One archive for the whole project. The compose file is read to resolve the
+project name and its named volumes (`<project>_<name>` unless overridden by
+`name:`/`external:`), then all of them are packed into a single file:
+
+```
+docker dvol compose-backup                # uses compose.yaml / compose.yml
+docker dvol compose-backup -f mycompose.yml
+docker dvol compose-backup -f mycompose.yml -p myproj
+docker dvol compose-restore -f mycompose.yml
+docker dvol compose-restore -f mycompose.yml backups/compose/myproj-<ts>.tar.gz
+```
+
+Bundles are stored in `backups/compose/<project>-<ts>.tar.gz`; each volume is a
+top-level directory in the archive plus a `manifest.json` listing the contents.
+Restore replaces each volume; missing volumes are created.
+
+Scheduled backups are supported by calling the CLI from cron, e.g.:
 
 ```cron
 0 2 * * *  /usr/local/bin/dvol-ctl backup app web-db

@@ -30,4 +30,36 @@ $D -root "$ROOT" backups app
 echo "== e2e: restore into non-existent volume (auto-create)"
 $D -root "$ROOT" restore newvol "$ROOT/backups/app/"app-*.tar.gz
 
+echo "== e2e: docker CLI plugin metadata"
+PLUGIN=./bin/dvol-cli-plugin
+$PLUGIN docker-cli-plugin-metadata | grep -q '"SchemaVersion":"0.1.0"'
+echo "== e2e: docker dvol list"
+$PLUGIN dvol list --root "$ROOT"
+echo "== e2e: docker dvol backup (comma-separated)"
+mkdir -p "$ROOT/volumes/web/www"
+printf '<html>cli</html>\n' > "$ROOT/volumes/web/www/index.html"
+$PLUGIN dvol backup web,newvol --root "$ROOT"
+echo "== e2e: docker dvol restore"
+rm -rf "$ROOT/volumes/web"
+$PLUGIN dvol restore web --root "$ROOT"
+[[ "$(cat "$ROOT/volumes/web/www/index.html")" == '<html>cli</html>' ]]
+
+echo "== e2e: compose bundle (single archive, all volumes)"
+COMPOSE_DIR="$ROOT/compose-src"
+mkdir -p "$COMPOSE_DIR"
+cat > "$COMPOSE_DIR/compose.yaml" <<YAML
+name: e2eproj
+volumes:
+  data:
+  cache:
+YAML
+$D -root "$ROOT" create e2eproj_data e2eproj_cache
+printf 'value=1\n' > "$ROOT/volumes/e2eproj_data/settings.ini"
+$PLUGIN dvol compose-backup -f "$COMPOSE_DIR/compose.yaml" --root "$ROOT" | grep -q "backed up 2 volume"
+$D -root "$ROOT" rm e2eproj_data e2eproj_cache
+$PLUGIN dvol compose-restore -f "$COMPOSE_DIR/compose.yaml" --root "$ROOT" | grep -q "restored 2 volume"
+[[ "$(cat "$ROOT/volumes/e2eproj_data/settings.ini")" == 'value=1' ]]
+BUNDLES=("$ROOT"/backups/compose/*.tar.gz)
+[[ ${#BUNDLES[@]} -eq 1 ]]
+
 echo "e2e OK"

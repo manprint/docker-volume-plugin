@@ -2,7 +2,10 @@ module github.com/fabio/dvol
 
 go 1.26.1
 
-require github.com/docker/go-plugins-helpers v0.0.0-20240701071450-45e2431495c8
+require (
+	github.com/docker/go-plugins-helpers v0.0.0-20240701071450-45e2431495c8
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
