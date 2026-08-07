@@ -179,6 +179,42 @@ func TestBackupNeverModifiesSource(t *testing.T) {
 	}
 }
 
+// TestBackupInterruptionKeepsSourceAndExistingArchive verifies the failure
+// boundary of the atomic archive writer. A failure after the source has been
+// fully read must not alter the source or replace an already valid backup.
+func TestBackupInterruptionKeepsSourceAndExistingArchive(t *testing.T) {
+	s := newTestStore(t)
+	before := makeRichVolume(t, s, "web")
+	outDir := t.TempDir()
+	final := filepath.Join(outDir, "web.tar.gz")
+	if err := os.WriteFile(final, []byte("previous valid archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := writeArchive(final, BackupOptions{}, func(tw *tar.Writer) error {
+		if err := addTreeTo(tw, s.VolumePath("web"), ""); err != nil {
+			return err
+		}
+		return fmt.Errorf("simulated backup interruption")
+	})
+	if err == nil {
+		t.Fatal("interrupted backup unexpectedly succeeded")
+	}
+
+	assertTreeUnchanged(t, s.VolumePath("web"), "source volume after interrupted backup", before, snapshotTree(t, s.VolumePath("web")))
+	got, err := os.ReadFile(final)
+	if err != nil || string(got) != "previous valid archive" {
+		t.Fatalf("existing archive was replaced or damaged: %q err=%v", got, err)
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(final) {
+		t.Fatalf("temporary archive was left behind after interruption: %v", entries)
+	}
+}
+
 // TestBackupBundleNeverModifiesSource: the multi-volume path must be equally
 // read-only for every volume it packs.
 func TestBackupBundleNeverModifiesSource(t *testing.T) {

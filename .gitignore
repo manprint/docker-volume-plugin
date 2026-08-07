@@ -22,3 +22,4 @@
 # Env / secrets
 .env
 *.env.local
+.serena

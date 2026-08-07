@@ -59,31 +59,34 @@ func (s *Store) BackupWithOptions(name string, opts BackupOptions) (string, erro
 	if _, err := s.Get(name); err != nil {
 		return "", err
 	}
+	return s.BackupSourceWithOptions(name, s.VolumePath(name), opts)
+}
+
+// BackupSourceWithOptions backs up an arbitrary directory under the logical
+// volume name. It is used by docker dvol for Docker volumes whose driver is
+// not dvol; the directory is normally the volume's Docker mountpoint.
+func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions) (string, error) {
+	if err := checkName(name); err != nil {
+		return "", err
+	}
+	if err := opts.Validate(); err != nil {
+		return "", err
+	}
+	fi, err := os.Stat(source)
+	if err != nil {
+		return "", fmt.Errorf("volume source %q: %w", source, err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("volume source %q is not a directory", source)
+	}
 	bdir := s.backupDir(name)
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(bdir, fmt.Sprintf("%s-%s.tar.%s", name, ts(), opts.norm().ext()))
-
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	gz, err := opts.newWriter(f)
-	if err != nil {
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-	tw := tar.NewWriter(gz)
-	if err := addTreeTo(tw, s.VolumePath(name), ""); err != nil {
-		tw.Close()
-		gz.Close()
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-	if err := closeTar(tw, gz, f, path); err != nil {
+	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
+		return addTreeTo(tw, source, "")
+	}); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -116,54 +119,115 @@ func (s *Store) BackupBundleWithOptions(names []string, outDir, prefix string, o
 	}
 	clean := append([]string{}, names...) // names in order
 	sort.Strings(clean)
+	sources := make(map[string]string, len(clean))
+	for _, name := range clean {
+		sources[name] = s.VolumePath(name)
+	}
+	return s.BackupBundleSourcesWithOptions(clean, sources, outDir, prefix, opts)
+}
+
+// BackupBundleSourcesWithOptions backs up arbitrary directories as a single
+// bundle. sources maps each logical volume name to its source directory.
+func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[string]string, outDir, prefix string, opts BackupOptions) (string, error) {
+	if err := opts.Validate(); err != nil {
+		return "", err
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no volumes to back up")
+	}
+	clean := append([]string{}, names...)
+	sort.Strings(clean)
+	for _, name := range clean {
+		if err := checkName(name); err != nil {
+			return "", err
+		}
+		source, ok := sources[name]
+		if !ok {
+			return "", fmt.Errorf("no source for volume %q", name)
+		}
+		fi, err := os.Stat(source)
+		if err != nil {
+			return "", fmt.Errorf("volume source %q: %w", source, err)
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("volume source %q is not a directory", source)
+		}
+	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(outDir, fmt.Sprintf("%s-%s.tar.%s", prefix, ts(), opts.norm().ext()))
-
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	gz, err := opts.newWriter(f)
-	if err != nil {
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-	tw := tar.NewWriter(gz)
-
-	mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
-	mb, _ := json.Marshal(mf)
-	if err := tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o644, Size: int64(len(mb)), Typeflag: tar.TypeReg}); err != nil {
-		tw.Close()
-		gz.Close()
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-	if _, err := tw.Write(mb); err != nil {
-		tw.Close()
-		gz.Close()
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-
-	for _, name := range clean {
-		if err := addTreeTo(tw, s.VolumePath(name), name); err != nil {
-			tw.Close()
-			gz.Close()
-			f.Close()
-			os.Remove(path)
-			return "", err
+	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
+		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
+		mb, err := json.Marshal(mf)
+		if err != nil {
+			return err
 		}
-	}
-	if err := closeTar(tw, gz, f, path); err != nil {
+		if err := tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o644, Size: int64(len(mb)), Typeflag: tar.TypeReg}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(mb); err != nil {
+			return err
+		}
+		for _, name := range clean {
+			if err := addTreeTo(tw, sources[name], name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// writeArchive builds an archive in a private file and publishes it only
+// after the complete stream has been closed and synced. A failed or
+// interrupted write therefore cannot expose a partial archive under its
+// final name or replace an existing valid archive.
+func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) error) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".dvol-backup-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		cleanup()
+		return err
+	}
+
+	w, err := opts.newWriter(f)
+	if err != nil {
+		cleanup()
+		return err
+	}
+	tw := tar.NewWriter(w)
+	if err := populate(tw); err != nil {
+		// Best-effort close only to release buffers and the file descriptor; the
+		// archive is discarded regardless of any close error at this point.
+		_ = tw.Close()
+		_ = w.Close()
+		cleanup()
+		return err
+	}
+	if err := closeTar(tw, w, f, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// The rename is atomic, but syncing the parent makes the new directory
+	// entry durable across a power loss on filesystems that support fsync.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("archive published but directory sync failed: %w", err)
+	}
+	return nil
 }
 
 // ListArchives returns the .tar.gz files in dir sorted by creation time.
@@ -202,20 +266,38 @@ func ts() string { return time.Now().UTC().Format("20060102-150405.000000000") }
 
 func closeTar(tw *tar.Writer, w io.Closer, f *os.File, path string) error {
 	if err := tw.Close(); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = w.Close()
+		_ = f.Close()
+		_ = os.Remove(path)
 		return err
 	}
 	if err := w.Close(); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return err
 	}
 	return nil
+}
+
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // addTreeTo writes the volume root entry followed by every file under dir.
@@ -338,8 +420,25 @@ func (s *Store) Restore(name, backupPath string) error {
 	if err := s.ensureVolume(name); err != nil {
 		return err
 	}
-	vdir := s.VolumePath(name)
-	staging, err := os.MkdirTemp(filepath.Dir(vdir), ".restore-*")
+	return s.RestoreSource(name, s.VolumePath(name), backupPath)
+}
+
+// RestoreSource replaces an arbitrary Docker volume mountpoint with the
+// contents of a backup archive. Unlike Restore, it does not create dvol
+// metadata; the Docker Engine already owns the volume metadata.
+func (s *Store) RestoreSource(name, target, backupPath string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if _, err := os.Stat(backupPath); err != nil {
+		return fmt.Errorf("backup not found: %w", err)
+	}
+	if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+		return fmt.Errorf("volume target %q is not a directory", target)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("volume target %q: %w", target, err)
+	}
+	staging, err := os.MkdirTemp(filepath.Dir(target), ".restore-*")
 	if err != nil {
 		return err
 	}
@@ -354,7 +453,7 @@ func (s *Store) Restore(name, backupPath string) error {
 	if n == 0 {
 		return fmt.Errorf("backup archive %q contains no entries", backupPath)
 	}
-	return replaceStage(staging, vdir)
+	return replaceStage(staging, target)
 }
 
 // RestoreBundle restores volumes from a bundle archive. Only volumes in names
@@ -424,6 +523,106 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 	return nil
 }
 
+// RestoreBundleSources restores a bundle into arbitrary Docker volume
+// mountpoints. Each target gets a staging directory on its own filesystem so
+// the final rename also works when Docker volumes and the dvol backup store
+// are on different filesystems.
+func (s *Store) RestoreBundleSources(path string, targets map[string]string) error {
+	if len(targets) == 0 {
+		return fmt.Errorf("no volume targets supplied")
+	}
+	type stagedVolume struct {
+		name    string
+		staging string
+		cleanup string
+		target  string
+	}
+	names := make([]string, 0, len(targets))
+	for name, target := range targets {
+		if err := checkName(name); err != nil {
+			return err
+		}
+		if target == "" {
+			return fmt.Errorf("empty target for volume %q", name)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	staged := make([]stagedVolume, 0, len(names))
+	cleanup := func() {
+		for _, v := range staged {
+			_ = os.RemoveAll(v.cleanup)
+		}
+	}
+	defer cleanup()
+
+	for _, name := range names {
+		target := targets[name]
+		if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+			return fmt.Errorf("volume target %q is not a directory", target)
+		} else if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("volume target %q: %w", target, err)
+		}
+		stage, err := os.MkdirTemp(filepath.Dir(target), "."+name+".restore-*")
+		if err != nil {
+			return err
+		}
+		count := 0
+		err = extractTarTo(stage, path, func(entry string) (string, bool, error) {
+			if entry == "manifest.json" {
+				return "", false, nil
+			}
+			vol, rest, ok := splitBundlePath(entry)
+			if !ok {
+				return "", false, fmt.Errorf("malformed bundle entry %q", entry)
+			}
+			if vol != name {
+				return "", false, nil
+			}
+			count++
+			if rest == "" {
+				return vol, true, nil
+			}
+			return vol + "/" + rest, true, nil
+		})
+		if err != nil {
+			_ = os.RemoveAll(stage)
+			return err
+		}
+		if count == 0 {
+			_ = os.RemoveAll(stage)
+			return fmt.Errorf("bundle contains no volume %q", name)
+		}
+		entries, err := os.ReadDir(stage)
+		if err != nil {
+			_ = os.RemoveAll(stage)
+			return err
+		}
+		if len(entries) != 1 || entries[0].Name() != name {
+			_ = os.RemoveAll(stage)
+			return fmt.Errorf("bundle contains invalid staged root for volume %q", name)
+		}
+		root := filepath.Join(stage, name)
+		fi, err := os.Lstat(root)
+		if err != nil {
+			_ = os.RemoveAll(stage)
+			return err
+		}
+		if !fi.IsDir() {
+			_ = os.RemoveAll(stage)
+			return fmt.Errorf("refusing to restore volume %q: archive entry is not a directory", name)
+		}
+		staged = append(staged, stagedVolume{name: name, staging: root, cleanup: stage, target: target})
+	}
+
+	for _, v := range staged {
+		if err := replaceStage(v.staging, v.target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // replaceStage swaps the fully-extracted staging directory into target. The
 // staging root is verified to be a real directory: an archive entry turning
 // it into a symlink refuses the swap. The previous target is kept under a
@@ -437,7 +636,6 @@ func replaceStage(staging, target string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("refusing to replace volume with non-directory %q (entry escaped the archive?)", staging)
 	}
-	backup := target + ".dvol-old"
 	if _, err := os.Lstat(target); err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -446,12 +644,22 @@ func replaceStage(staging, target string) error {
 		// the metadata): nothing to preserve, just move the staging in place.
 		return os.Rename(staging, target)
 	}
-	os.RemoveAll(backup)
+	// Keep the old target in a private, collision-free path. A fixed suffix
+	// would collide with a valid volume name such as "foo.dvol-old".
+	backup, err := os.MkdirTemp(filepath.Dir(target), "."+filepath.Base(target)+".dvol-old-*")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
 	if err := os.Rename(target, backup); err != nil {
 		return err
 	}
 	if err := os.Rename(staging, target); err != nil {
-		os.Rename(backup, target) // roll back: target is still valid
+		if rollbackErr := os.Rename(backup, target); rollbackErr != nil {
+			return fmt.Errorf("replace volume: %w (rollback failed: %v)", err, rollbackErr)
+		}
 		return err
 	}
 	return os.RemoveAll(backup)

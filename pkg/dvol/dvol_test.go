@@ -16,6 +16,83 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+func TestStoreRecoversInterruptedReplace(t *testing.T) {
+	t.Run("before publish", func(t *testing.T) {
+		root := t.TempDir()
+		s, err := NewStore(Config{Root: root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Create("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s.VolumePath("web"), "state"), []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		rollback, err := os.MkdirTemp(filepath.Dir(s.VolumePath("web")), ".web.dvol-old-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(rollback); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(s.VolumePath("web"), rollback); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := NewStore(Config{Root: root}); err != nil {
+			t.Fatalf("NewStore recovery: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(s.VolumePath("web"), "state"))
+		if err != nil || string(got) != "old" {
+			t.Fatalf("old volume was not recovered: %q err=%v", got, err)
+		}
+		if _, err := os.Lstat(rollback); !os.IsNotExist(err) {
+			t.Fatalf("rollback directory remains: %v", err)
+		}
+	})
+
+	t.Run("after publish", func(t *testing.T) {
+		root := t.TempDir()
+		s, err := NewStore(Config{Root: root})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Create("web", nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s.VolumePath("web"), "state"), []byte("new"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		rollback, err := os.MkdirTemp(filepath.Dir(s.VolumePath("web")), ".web.dvol-old-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(rollback); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(rollback, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(rollback, "state"), []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := NewStore(Config{Root: root}); err != nil {
+			t.Fatalf("NewStore recovery: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(s.VolumePath("web"), "state"))
+		if err != nil || string(got) != "new" {
+			t.Fatalf("published volume was not preserved: %q err=%v", got, err)
+		}
+		if _, err := os.Lstat(rollback); !os.IsNotExist(err) {
+			t.Fatalf("completed rollback directory remains: %v", err)
+		}
+	})
+}
+
 func TestCreateGetListRemove(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.Create("data", map[string]string{"type": "ssd"}); err != nil {

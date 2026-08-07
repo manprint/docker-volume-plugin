@@ -85,6 +85,65 @@ func TestRestoreCorruptArchivePreservesVolume(t *testing.T) {
 	}
 }
 
+func TestExternalSourceBackupAndRestore(t *testing.T) {
+	s := newTestStore(t)
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "legacy.txt"), []byte("legacy-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	archive, err := s.BackupSourceWithOptions("legacy", source, BackupOptions{})
+	if err != nil {
+		t.Fatalf("BackupSourceWithOptions: %v", err)
+	}
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "old.txt"), []byte("must be replaced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RestoreSource("legacy", target, archive); err != nil {
+		t.Fatalf("RestoreSource: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, "legacy.txt"))
+	if err != nil || string(got) != "legacy-data" {
+		t.Fatalf("restored external source is wrong: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "old.txt")); !os.IsNotExist(err) {
+		t.Fatalf("old target data should have been replaced")
+	}
+}
+
+func TestRestoreDoesNotDeleteCollidingVolume(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Create("foo", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create("foo.dvol-old", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.VolumePath("foo"), "data.txt"), []byte("restored"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.VolumePath("foo.dvol-old"), "sentinel.txt"), []byte("must survive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	path, err := s.Backup("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Restore("foo", path); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(s.VolumePath("foo.dvol-old"), "sentinel.txt"))
+	if err != nil || string(got) != "must survive" {
+		t.Fatalf("colliding volume was damaged: %q err=%v", got, err)
+	}
+	if _, err := s.Get("foo.dvol-old"); err != nil {
+		t.Fatalf("colliding volume metadata was damaged: %v", err)
+	}
+}
+
 func TestRestoreRejectsSymlinkEscape(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.Create("web", nil); err != nil {

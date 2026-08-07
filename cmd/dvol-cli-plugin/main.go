@@ -9,6 +9,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -27,8 +28,9 @@ const (
 )
 
 type app struct {
-	store *dvol.Store
-	out   *tabwriter.Writer
+	store  *dvol.Store
+	docker dockerVolumeClient
+	out    *tabwriter.Writer
 }
 
 func main() {
@@ -58,7 +60,7 @@ func main() {
 		fail(err)
 	}
 
-	a := &app{store: store}
+	a := &app{store: store, docker: newDockerCLI()}
 	if len(args) == 0 {
 		a.usage()
 		return
@@ -117,16 +119,103 @@ func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
 	return root, backupDir, out
 }
 
+// volumeSource resolves a logical Docker volume to the directory containing
+// its data. dvol-managed volumes use the store directly; every other Docker
+// driver uses the mountpoint reported by Docker Engine.
+func (a *app) volumeSource(name string) (source string, managedByStore bool, err error) {
+	if _, err := a.store.Get(name); err == nil {
+		return a.store.VolumePath(name), true, nil
+	} else if !errors.Is(err, dvol.ErrNotFound) {
+		return "", false, err
+	}
+	if a.docker == nil {
+		return "", false, errDockerVolumeNotFound
+	}
+	info, err := a.docker.Inspect(name)
+	if err != nil {
+		return "", false, err
+	}
+	if info.Mountpoint == "" {
+		return "", false, fmt.Errorf("Docker volume %q has no usable mountpoint", name)
+	}
+	return info.Mountpoint, false, nil
+}
+
+func (a *app) restoreVolume(name, archive string) error {
+	source, managedByStore, err := a.volumeSource(name)
+	if err != nil {
+		if !errors.Is(err, errDockerVolumeNotFound) {
+			return err
+		}
+		if a.docker == nil {
+			// Preserve the Store API behavior for direct/unit-test usage.
+			return a.store.Restore(name, archive)
+		}
+		info, err := a.docker.Create(name)
+		if err != nil {
+			return fmt.Errorf("create Docker volume %q: %w", name, err)
+		}
+		source = info.Mountpoint
+		managedByStore = false
+	}
+	if managedByStore {
+		return a.store.Restore(name, archive)
+	}
+	return a.store.RestoreSource(name, source, archive)
+}
+
+func (a *app) isVolume(name string) bool {
+	if _, err := a.store.Get(name); err == nil {
+		return true
+	}
+	if a.docker == nil {
+		return false
+	}
+	_, err := a.docker.Inspect(name)
+	return err == nil
+}
+
 // cmdList: docker dvol list
 func (a *app) cmdList(args []string) {
-	vols, err := a.store.List()
+	if a.docker == nil {
+		vols, err := a.store.List()
+		if err != nil {
+			fail(err)
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tDRIVER\tCREATED\tSIZE\tMOUNTPOINT")
+		for _, v := range vols {
+			fmt.Fprintf(tw, "%s\tdvol\t%s\t%s\t%s\n", v.Name,
+				v.CreatedAt.Format("2006-01-02 15:04"), humanSize(v.Size), a.store.VolumePath(v.Name))
+		}
+		tw.Flush()
+		return
+	}
+	dockerVolumes, err := a.docker.List()
 	if err != nil {
 		fail(err)
 	}
+	storeVolumes, err := a.store.List()
+	if err != nil {
+		fail(err)
+	}
+	seen := map[string]bool{}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tCREATED\tSIZE\tMOUNTPOINT")
-	for _, v := range vols {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", v.Name,
+	fmt.Fprintln(tw, "NAME\tDRIVER\tCREATED\tSIZE\tMOUNTPOINT")
+	for _, v := range dockerVolumes {
+		seen[v.Name] = true
+		created, size := "-", "-"
+		if meta, err := a.store.Get(v.Name); err == nil {
+			created = meta.CreatedAt.Format("2006-01-02 15:04")
+			size = humanSize(meta.Size)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", v.Name, v.Driver, created, size, v.Mountpoint)
+	}
+	for _, v := range storeVolumes {
+		if seen[v.Name] {
+			continue
+		}
+		fmt.Fprintf(tw, "%s\tdvol\t%s\t%s\t%s\n", v.Name,
 			v.CreatedAt.Format("2006-01-02 15:04"), humanSize(v.Size), a.store.VolumePath(v.Name))
 	}
 	tw.Flush()
@@ -166,7 +255,11 @@ func (a *app) cmdBackup(args []string) {
 		fail("usage: docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...")
 	}
 	for _, n := range names {
-		path, err := a.store.BackupWithOptions(n, opts)
+		source, _, err := a.volumeSource(n)
+		if err != nil {
+			fail(err)
+		}
+		path, err := a.store.BackupSourceWithOptions(n, source, opts)
 		if err != nil {
 			fail(err)
 		}
@@ -199,7 +292,7 @@ func (a *app) cmdRestore(args []string) {
 		if err != nil {
 			fail(err)
 		}
-		if err := a.store.Restore(names[0], path); err != nil {
+		if err := a.restoreVolume(names[0], path); err != nil {
 			fail(err)
 		}
 		fmt.Printf("restored %s from %s\n", names[0], path)
@@ -212,12 +305,6 @@ func (a *app) cmdRestore(args []string) {
 	}
 }
 
-// isVolume reports whether name is an existing volume in the store.
-func (a *app) isVolume(name string) bool {
-	_, err := a.store.Get(name)
-	return err == nil
-}
-
 func (a *app) restoreLatest(name string) error {
 	infos, err := a.store.ListBackups(name)
 	if err != nil {
@@ -227,7 +314,7 @@ func (a *app) restoreLatest(name string) error {
 		return fmt.Errorf("no backups found for volume %q", name)
 	}
 	latest := infos[len(infos)-1]
-	if err := a.store.Restore(name, latest.Path); err != nil {
+	if err := a.restoreVolume(name, latest.Path); err != nil {
 		return err
 	}
 	fmt.Printf("restored %s from %s\n", name, latest.Path)
@@ -259,11 +346,14 @@ func (a *app) cmdComposeBackup(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	names := existingVolumes(a.store, cf)
-	if len(names) == 0 {
-		fail(fmt.Sprintf("no volumes found in %s exist in the dvol store (did you create them with `docker volume create -d dvol`?)", path))
+	names, sources, err := a.existingVolumes(cf)
+	if err != nil {
+		fail(err)
 	}
-	out, err := a.store.BackupBundleWithOptions(names, a.store.BundleDir(), cf.Project, opts)
+	if len(names) == 0 {
+		fail(fmt.Sprintf("no volumes from %s exist in Docker", path))
+	}
+	out, err := a.store.BackupBundleSourcesWithOptions(names, sources, a.store.BundleDir(), cf.Project, opts)
 	if err != nil {
 		fail(err)
 	}
@@ -300,7 +390,30 @@ func (a *app) cmdComposeRestore(args []string) {
 			fail(err)
 		}
 	}
-	if err := a.store.RestoreBundle(archive, names); err != nil {
+	if a.docker == nil {
+		if err := a.store.RestoreBundle(archive, names); err != nil {
+			fail(err)
+		}
+		fmt.Printf("restored %d volume(s) (%s) from %s\n", len(names), strings.Join(names, ", "), archive)
+		return
+	}
+	targets := make(map[string]string, len(names))
+	for _, name := range names {
+		source, _, err := a.volumeSource(name)
+		if errors.Is(err, errDockerVolumeNotFound) {
+			info, createErr := a.docker.Create(name)
+			if createErr != nil {
+				fail(fmt.Errorf("create Docker volume %q: %w", name, createErr))
+			}
+			source = info.Mountpoint
+			err = nil
+		}
+		if err != nil {
+			fail(err)
+		}
+		targets[name] = source
+	}
+	if err := a.store.RestoreBundleSources(archive, targets); err != nil {
 		fail(err)
 	}
 	fmt.Printf("restored %d volume(s) (%s) from %s\n", len(names), strings.Join(names, ", "), archive)
@@ -359,15 +472,22 @@ func resolveComposeFile(files []string) (string, error) {
 	return "", fmt.Errorf("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yml); use -f")
 }
 
-func existingVolumes(store *dvol.Store, cf *dvol.ComposeFile) []string {
+func (a *app) existingVolumes(cf *dvol.ComposeFile) ([]string, map[string]string, error) {
 	var out []string
+	sources := map[string]string{}
 	for _, v := range cf.Volumes {
-		if _, err := store.Get(v.Name); err == nil {
+		source, _, err := a.volumeSource(v.Name)
+		if err == nil {
 			out = append(out, v.Name)
+			sources[v.Name] = source
+			continue
+		}
+		if !errors.Is(err, errDockerVolumeNotFound) {
+			return nil, nil, err
 		}
 	}
 	sort.Strings(out)
-	return out
+	return out, sources, nil
 }
 
 func composeVolumeNames(cf *dvol.ComposeFile) []string {

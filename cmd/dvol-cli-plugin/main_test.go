@@ -18,6 +18,104 @@ func newCLIStore(t *testing.T) *dvol.Store {
 	return s
 }
 
+type fakeDockerVolumes struct {
+	volumes           map[string]dockerVolumeInfo
+	createMountpoints map[string]string
+}
+
+func (f *fakeDockerVolumes) List() ([]dockerVolumeInfo, error) {
+	result := make([]dockerVolumeInfo, 0, len(f.volumes))
+	for _, volume := range f.volumes {
+		result = append(result, volume)
+	}
+	return result, nil
+}
+
+func (f *fakeDockerVolumes) Inspect(name string) (dockerVolumeInfo, error) {
+	volume, ok := f.volumes[name]
+	if !ok {
+		return dockerVolumeInfo{}, errDockerVolumeNotFound
+	}
+	return volume, nil
+}
+
+func (f *fakeDockerVolumes) Create(name string) (dockerVolumeInfo, error) {
+	if volume, ok := f.volumes[name]; ok {
+		return volume, nil
+	}
+	if mountpoint, ok := f.createMountpoints[name]; ok {
+		volume := dockerVolumeInfo{Name: name, Driver: "local", Mountpoint: mountpoint}
+		f.volumes[name] = volume
+		return volume, nil
+	}
+	return dockerVolumeInfo{}, errDockerVolumeNotFound
+}
+
+func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
+	store := newCLIStore(t)
+	mountpoint := t.TempDir()
+	if err := os.WriteFile(filepath.Join(mountpoint, "legacy.txt"), []byte("legacy-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeDockerVolumes{volumes: map[string]dockerVolumeInfo{
+		"legacy": {Name: "legacy", Driver: "local", Mountpoint: mountpoint},
+	}, createMountpoints: map[string]string{}}
+	a := &app{store: store, docker: fake}
+
+	source, managedByStore, err := a.volumeSource("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != mountpoint || managedByStore {
+		t.Fatalf("unexpected Docker source: %q managed=%v", source, managedByStore)
+	}
+	archive, err := store.BackupSourceWithOptions("legacy", source, dvol.BackupOptions{})
+	if err != nil {
+		t.Fatalf("BackupSourceWithOptions: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mountpoint, "changed.txt"), []byte("must disappear"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.restoreVolume("legacy", archive); err != nil {
+		t.Fatalf("restoreVolume: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(mountpoint, "legacy.txt"))
+	if err != nil || string(got) != "legacy-data" {
+		t.Fatalf("legacy volume data wrong: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(mountpoint, "changed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("changed Docker volume data should have been replaced")
+	}
+}
+
+func TestRestoreCreatesMissingDockerVolume(t *testing.T) {
+	store := newCLIStore(t)
+	if err := store.Create("seed", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.VolumePath("seed"), "data.txt"), []byte("seed-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := store.Backup("seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mountpoint := t.TempDir()
+	fake := &fakeDockerVolumes{
+		volumes:           map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{"new-local": mountpoint},
+	}
+	a := &app{store: store, docker: fake}
+	if err := a.restoreVolume("new-local", archive); err != nil {
+		t.Fatalf("restoreVolume: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(mountpoint, "data.txt"))
+	if err != nil || string(got) != "seed-data" {
+		t.Fatalf("new Docker volume data wrong: %q err=%v", got, err)
+	}
+}
+
 // TestCmdRestoreSpecificBackup pins the restore-with-selector path:
 // `docker dvol restore <vol> <backup>` must restore the requested archive,
 // not the latest one (regression: args were expanded as volume names).

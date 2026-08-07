@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,9 @@ func NewStore(cfg Config) (*Store, error) {
 			return nil, fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
+	if err := s.recoverInterruptedReplacements(); err != nil {
+		return nil, fmt.Errorf("recover interrupted volume replacement: %w", err)
+	}
 	return s, nil
 }
 
@@ -50,6 +54,72 @@ func (s *Store) backupsDir() string {
 func (s *Store) VolumePath(name string) string { return filepath.Join(s.volumesDir(), name) }
 
 func (s *Store) metaPath(name string) string { return filepath.Join(s.metaDir(), name+".json") }
+
+// recoverInterruptedReplacements repairs the only non-atomic window in a
+// directory swap: a process can die after the old target is renamed aside but
+// before the staged target is renamed into place. Rollback directories are
+// private and include the target name so they can be recovered on startup.
+func (s *Store) recoverInterruptedReplacements() error {
+	metaEntries, err := os.ReadDir(s.metaDir())
+	if err != nil {
+		return err
+	}
+	volumeEntries, err := os.ReadDir(s.volumesDir())
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, metaEntry := range metaEntries {
+		if metaEntry.IsDir() || !strings.HasSuffix(metaEntry.Name(), ".json") {
+			continue
+		}
+		name := strings.TrimSuffix(metaEntry.Name(), ".json")
+		if checkName(name) != nil {
+			continue
+		}
+		prefix := "." + name + ".dvol-old-"
+		var rollback []string
+		for _, volumeEntry := range volumeEntries {
+			if strings.HasPrefix(volumeEntry.Name(), prefix) {
+				if !volumeEntry.IsDir() {
+					return fmt.Errorf("rollback path %q is not a directory", volumeEntry.Name())
+				}
+				rollback = append(rollback, filepath.Join(s.volumesDir(), volumeEntry.Name()))
+			}
+		}
+		if len(rollback) == 0 {
+			continue
+		}
+		if len(rollback) > 1 {
+			return fmt.Errorf("multiple interrupted replacements for volume %q", name)
+		}
+
+		target := s.VolumePath(name)
+		_, targetErr := os.Lstat(target)
+		switch {
+		case targetErr == nil:
+			// The new target was published before the crash; only cleanup was
+			// interrupted, so discard the old copy.
+			if err := os.RemoveAll(rollback[0]); err != nil {
+				return err
+			}
+			changed = true
+		case os.IsNotExist(targetErr):
+			// The first rename completed but the publish did not. Restore the
+			// old target so the volume name is present again.
+			if err := os.Rename(rollback[0], target); err != nil {
+				return err
+			}
+			changed = true
+		default:
+			return targetErr
+		}
+	}
+	if changed {
+		return syncDir(s.volumesDir())
+	}
+	return nil
+}
 
 func checkName(name string) error {
 	if !nameRe.MatchString(name) {

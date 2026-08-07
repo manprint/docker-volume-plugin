@@ -84,7 +84,9 @@ YAML
 $D -root "$ROOT" create e2eproj_data e2eproj_cache
 printf 'value=1\n' > "$ROOT/volumes/e2eproj_data/settings.ini"
 $PLUGIN dvol compose-backup -f "$COMPOSE_DIR/compose.yaml" --root "$ROOT" | grep -q "backed up 2 volume"
-$D -root "$ROOT" rm e2eproj_data e2eproj_cache
+# Keep these store-managed volumes in place: this smoke test intentionally does
+# not require a Docker daemon. A real Docker-volume restore is exercised by the
+# host CLI against the mountpoint returned by Docker.
 $PLUGIN dvol compose-restore -f "$COMPOSE_DIR/compose.yaml" --root "$ROOT" | grep -q "restored 2 volume"
 [[ "$(cat "$ROOT/volumes/e2eproj_data/settings.ini")" == 'value=1' ]]
 BUNDLES=("$ROOT"/backups/compose/*.tar.gz)

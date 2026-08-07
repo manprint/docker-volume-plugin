@@ -77,6 +77,45 @@ func TestBackupBundleManifest(t *testing.T) {
 	}
 }
 
+func TestExternalBundleSourcesRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	sources := map[string]string{}
+	for _, name := range []string{"legacy_app", "legacy_db"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte("content-"+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sources[name] = dir
+	}
+	archive, err := s.BackupBundleSourcesWithOptions(
+		[]string{"legacy_db", "legacy_app"}, sources, filepath.Join(t.TempDir(), "compose"), "legacy", BackupOptions{},
+	)
+	if err != nil {
+		t.Fatalf("BackupBundleSourcesWithOptions: %v", err)
+	}
+
+	targets := map[string]string{}
+	for _, name := range []string{"legacy_app", "legacy_db"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "old.txt"), []byte("replace me"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		targets[name] = dir
+	}
+	if err := s.RestoreBundleSources(archive, targets); err != nil {
+		t.Fatalf("RestoreBundleSources: %v", err)
+	}
+	for _, name := range []string{"legacy_app", "legacy_db"} {
+		got, err := os.ReadFile(filepath.Join(targets[name], "data.txt"))
+		if err != nil || string(got) != "content-"+name {
+			t.Fatalf("%s data wrong: %q err=%v", name, got, err)
+		}
+		if _, err := os.Stat(filepath.Join(targets[name], "old.txt")); !os.IsNotExist(err) {
+			t.Fatalf("%s old target data should have been replaced", name)
+		}
+	}
+}
+
 func TestRestoreBundleAllAndRecreatesVolumes(t *testing.T) {
 	s := newTestStore(t)
 	for _, n := range []string{"app", "db"} {
