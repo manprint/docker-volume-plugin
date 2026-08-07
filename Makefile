@@ -2,7 +2,7 @@ GO          ?= go
 CLI_PLUGIN  = docker-dvol-linux
 BIN         = bin/dvol-cli-plugin bin/$(CLI_PLUGIN)
 
-.PHONY: all build test lint e2e acceptance cli-plugin-build cli-plugin-install clean
+.PHONY: all build test lint e2e acceptance acceptance-mongo cli-plugin-build cli-plugin-install clean
 
 all: build
 
@@ -21,9 +21,16 @@ e2e: build
 
 ## acceptance: run the full PostgreSQL and Odoo Docker acceptance scenarios
 ## Build first as the normal user; only the acceptance run needs privileges.
+## acceptance: run the PostgreSQL/Odoo and MongoDB Docker acceptance suites
 acceptance:
 	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance'" >&2; exit 1; }
 	./test/acceptance_e2e.sh
+	./test/acceptance_mongo_e2e.sh
+
+## acceptance-mongo: run the MongoDB Compose/startup-script acceptance matrix
+acceptance-mongo:
+	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance-mongo'" >&2; exit 1; }
+	./test/acceptance_mongo_e2e.sh
 
 ## lint: go vet
 lint:

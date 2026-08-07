@@ -224,6 +224,7 @@ make test
 make lint
 make e2e
 sudo make acceptance
+sudo make acceptance-mongo
 make clean
 ```
 
@@ -236,6 +237,11 @@ compressioni (`gzip`, `xz`, `zstd`). Richiede un Docker Engine operativo,
 permessi sui mountpoint dei volumi e può scaricare le immagini di test. Lo
 script rimuove al termine container, volumi, reti Compose, repository
 temporaneo e le immagini scaricate esclusivamente dalla suite.
+
+`make acceptance-mongo` esegue inoltre la matrice MongoDB basata sui file
+`test/acceptance/mongo-compose.yaml` e
+`test/acceptance/script-start.mongo.sh`. La matrice dettagliata è in
+`test/acceptance/mongo_test_matrix.md`.
 
 I test unitari coprono backup read-only, restore atomico, rollback,
 compressione, bundle Compose, interruzioni e gestione di mountpoint Docker.

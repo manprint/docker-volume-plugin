@@ -1,0 +1,31 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: changeme
+    command: ["mongod", "--logpath", "/var/log/mongodb/mongod.log"]
+    volumes:
+      - mongo_data:/data/db
+      - mongo_logs:/var/log/mongodb
+
+volumes:
+  mongo_data:
+    name: mongo_data
+    driver: local
+    driver_opts:
+      type: none
+      device: $PWD/volumes/mongo_data
+      o: bind
+
+  mongo_logs:
+    name: mongo_logs
+    driver: local
+    driver_opts:
+      type: none
+      device: $PWD/volumes/mongo_logs
+      o: bind
