@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/fabio/dvol/pkg/dvol"
 )
@@ -210,31 +211,41 @@ func (a *app) cmdBackup(args []string) {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
 	level := fs.Int("level", 0, "compression level (0 = format default)")
-	archiveName := ""
-	fs.StringVar(&archiveName, "archive-name", "", "archive name stem (one volume only; suffix is added automatically)")
-	fs.StringVar(&archiveName, "name", "", "alias for --archive-name")
+	var archiveNames multiFlag
+	fs.Var(&archiveNames, "archive-name", "archive name stem or volume::archive-name (repeatable)")
+	fs.Var(&archiveNames, "name", "alias for --archive-name")
 	includeTimestamp := false
 	fs.BoolVar(&includeTimestamp, "timestamp", false, "append _ddmmyyyy_HHMMSS to the archive name")
+	sameDestination := false
+	fs.BoolVar(&sameDestination, "same-destination", false, "store all archives directly in the destination directory")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, ArchiveName: archiveName, Timestamp: includeTimestamp}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Timestamp: includeTimestamp, SameDestination: sameDestination}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
 	names := expandNames(fs.Args())
 	if len(names) == 0 {
-		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...")
+		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...")
 	}
-	if archiveName != "" && len(names) != 1 {
-		fail("--archive-name can be used only when backing up one volume")
+	archiveMap, err := parseArchiveNames(archiveNames, names)
+	if err != nil {
+		fail(err)
+	}
+	timestampValue := ""
+	if includeTimestamp {
+		timestampValue = time.Now().Format("02012006_150405")
 	}
 	for _, n := range names {
 		source, err := a.volumeSource(n)
 		if err != nil {
 			fail(err)
 		}
-		path, err := a.store.BackupSourceWithOptions(n, source, opts)
+		currentOpts := opts
+		currentOpts.ArchiveName = archiveMap[n]
+		currentOpts.TimestampValue = timestampValue
+		path, err := a.store.BackupSourceWithOptions(n, source, currentOpts)
 		if err != nil {
 			fail(err)
 		}
@@ -398,9 +409,9 @@ func (a *app) usage() {
 Usage:
   docker dvol list                        list volumes
   docker dvol backups <volume>            list backups of a volume
-  docker dvol backup [--destination DIR] [--archive-name NAME] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
+	  docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
   docker dvol restore <volume>... [backup]  restore volumes (optional backup for a single volume)
-  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N]   backup all volumes of a compose project into one archive
+	  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N]   backup all volumes of a compose project into one archive
   docker dvol compose-restore [-f file.yml] [-p project] [archive]  restore them
 
 Global flags: --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)
@@ -420,6 +431,56 @@ func expandNames(args []string) []string {
 		}
 	}
 	return out
+}
+
+// parseArchiveNames accepts either one legacy name for one volume or
+// repeatable volume::archive-name mappings. If mappings are used, every
+// selected volume must be mapped exactly once.
+func parseArchiveNames(values []string, volumes []string) (map[string]string, error) {
+	result := make(map[string]string)
+	if len(values) == 0 {
+		return result, nil
+	}
+	selected := make(map[string]bool, len(volumes))
+	for _, volume := range volumes {
+		selected[volume] = true
+	}
+	for _, value := range values {
+		volume, archive, mapped := strings.Cut(value, "::")
+		if !mapped {
+			if len(values) != 1 || len(selected) != 1 {
+				return nil, fmt.Errorf("--archive-name must use VOLUME::NAME for multiple volumes")
+			}
+			for volume = range selected {
+				archive = value
+			}
+		} else if !selected[volume] {
+			return nil, fmt.Errorf("--archive-name refers to volume %q, which is not being backed up", volume)
+		}
+		if volume == "" || archive == "" {
+			return nil, fmt.Errorf("invalid --archive-name %q (use VOLUME::NAME)", value)
+		}
+		if _, exists := result[volume]; exists {
+			return nil, fmt.Errorf("duplicate --archive-name mapping for volume %q", volume)
+		}
+		if err := (dvol.BackupOptions{ArchiveName: archive}).Validate(); err != nil {
+			return nil, err
+		}
+		result[volume] = archive
+	}
+	if len(result) != len(selected) {
+		return nil, fmt.Errorf("when using --archive-name mappings, every selected volume must have a mapping")
+	}
+	if len(selected) > 1 {
+		seen := make(map[string]string, len(result))
+		for volume, archive := range result {
+			if previous, exists := seen[archive]; exists {
+				return nil, fmt.Errorf("archive name %q is used for both %q and %q", archive, previous, volume)
+			}
+			seen[archive] = volume
+		}
+	}
+	return result, nil
 }
 
 // multiFlag is a repeatable string flag (flag pkg has no StringSlice).

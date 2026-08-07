@@ -239,6 +239,44 @@ func TestCmdBackupArchiveNameAndTimestamp(t *testing.T) {
 	}
 }
 
+func TestCmdBackupMultipleMappingsSameDestination(t *testing.T) {
+	destination := t.TempDir()
+	store, err := dvol.NewStore(dvol.Config{Root: t.TempDir(), BackupsDir: destination})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"pg_data", "filestore_data"} {
+		if err := store.Create(name, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(store.VolumePath(name), "data.txt"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := &app{store: store, docker: dockerForStore(store, "pg_data", "filestore_data")}
+	a.cmdBackup([]string{
+		"--archive-name", "pg_data::postgres-odoo",
+		"--archive-name", "filestore_data::filestore-odoo",
+		"--same-destination",
+		"--timestamp",
+		"pg_data", "filestore_data",
+	})
+
+	pg, err := store.ListBackups("pg_data")
+	if err != nil || len(pg) != 1 || filepath.Dir(pg[0].Path) != destination || !strings.HasPrefix(pg[0].Name, "postgres-odoo_") {
+		t.Fatalf("pg_data flat backup: %+v err=%v", pg, err)
+	}
+	files, err := store.ListBackups("filestore_data")
+	if err != nil || len(files) != 1 || filepath.Dir(files[0].Path) != destination || !strings.HasPrefix(files[0].Name, "filestore-odoo_") {
+		t.Fatalf("filestore_data flat backup: %+v err=%v", files, err)
+	}
+	pgStamp := strings.TrimPrefix(strings.TrimSuffix(pg[0].Name, ".tar.gz"), "postgres-odoo_")
+	fileStamp := strings.TrimPrefix(strings.TrimSuffix(files[0].Name, ".tar.gz"), "filestore-odoo_")
+	if pgStamp != fileStamp {
+		t.Fatalf("archives did not share one timestamp: %q vs %q", pgStamp, fileStamp)
+	}
+}
+
 func TestExtractGlobalFlagsDestination(t *testing.T) {
 	root, destination, args := extractGlobalFlags([]string{
 		"backup", "--destination", "/home/ubuntu/dump-mongo-vol", "mongo_data",
@@ -248,6 +286,35 @@ func TestExtractGlobalFlagsDestination(t *testing.T) {
 	}
 	if got := strings.Join(args, " "); got != "backup mongo_data" {
 		t.Fatalf("unexpected remaining args: %q", got)
+	}
+}
+
+func TestParseArchiveNames(t *testing.T) {
+	got, err := parseArchiveNames([]string{
+		"pg_data::postgres-odoo",
+		"filestore_data::filestore-odoo",
+	}, []string{"pg_data", "filestore_data"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["pg_data"] != "postgres-odoo" || got["filestore_data"] != "filestore-odoo" {
+		t.Fatalf("unexpected archive mappings: %#v", got)
+	}
+
+	bad := [][]string{
+		{"pg_data::one", "pg_data::two"},
+		{"unknown::archive"},
+		{"pg_data::one"},
+	}
+	volumes := [][]string{
+		{"pg_data"},
+		{"pg_data"},
+		{"pg_data", "filestore_data"},
+	}
+	for i := range bad {
+		if _, err := parseArchiveNames(bad[i], volumes[i]); err == nil {
+			t.Fatalf("mapping %v unexpectedly succeeded", bad[i])
+		}
 	}
 }
 

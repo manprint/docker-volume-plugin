@@ -80,11 +80,21 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 		return "", fmt.Errorf("volume source %q is not a directory", source)
 	}
 	bdir := s.backupDir(name)
+	if opts.SameDestination {
+		bdir = s.backupsDir()
+	}
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(bdir, archiveFilename(name, opts))
-	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
+	archiveName := archiveFilename(name, opts)
+	path := filepath.Join(bdir, archiveName)
+	if opts.SameDestination {
+		if err := s.writeFlatBackup(name, archiveName, path, opts, func(tw *tar.Writer) error {
+			return addTreeTo(tw, source, "")
+		}); err != nil {
+			return "", err
+		}
+	} else if err := writeArchive(path, opts, func(tw *tar.Writer) error {
 		return addTreeTo(tw, source, "")
 	}); err != nil {
 		return "", err
@@ -276,7 +286,11 @@ func archiveFilename(defaultName string, opts BackupOptions) string {
 		}
 	}
 	if opts.Timestamp {
-		base += "_" + time.Now().Format("02012006_150405")
+		timestamp := opts.TimestampValue
+		if timestamp == "" {
+			timestamp = time.Now().Format("02012006_150405")
+		}
+		base += "_" + timestamp
 	} else if opts.ArchiveName == "" {
 		base += "-" + ts()
 	}
@@ -930,7 +944,17 @@ func safeJoin(base, p string) (string, error) {
 
 // ListBackups returns the backups of a volume sorted by creation time.
 func (s *Store) ListBackups(name string) ([]BackupInfo, error) {
-	return s.ListArchives(s.backupDir(name))
+	nested, err := s.ListArchives(s.backupDir(name))
+	if err != nil {
+		return nil, err
+	}
+	flat, err := s.flatBackupInfos(name)
+	if err != nil {
+		return nil, err
+	}
+	infos := append(nested, flat...)
+	sort.Slice(infos, func(i, j int) bool { return infos[i].CreatedAt.Before(infos[j].CreatedAt) })
+	return infos, nil
 }
 
 // BundleDir returns the directory used for compose (multi-volume) bundles.
@@ -945,8 +969,24 @@ func (s *Store) ResolveBackup(vol, arg string) (string, error) {
 		return matches[0], nil
 	}
 	matches, err := filepath.Glob(filepath.Join(s.backupDir(vol), arg))
-	if err == nil && len(matches) == 1 {
+	if err != nil {
+		return "", err
+	}
+	if len(matches) == 1 {
 		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("multiple backups matching %q for volume %q", arg, vol)
+	}
+	flat, err := s.flatBackupMatches(vol, arg)
+	if err != nil {
+		return "", err
+	}
+	if len(flat) == 1 {
+		return flat[0], nil
+	}
+	if len(flat) > 1 {
+		return "", fmt.Errorf("multiple backups matching %q for volume %q", arg, vol)
 	}
 	return "", fmt.Errorf("no backup matching %q for volume %q", arg, vol)
 }

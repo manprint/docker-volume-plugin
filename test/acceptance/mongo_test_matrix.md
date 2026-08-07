@@ -42,6 +42,18 @@ Il totale è quindi 18 casi: 2 bootstrap × 3 compressioni × 3 target di restor
 ### Backup
 
 - entrambi i volumi vengono backuppati con una singola invocazione multi-volume;
+- viene eseguito anche il backup flat multi-volume con due mapping ripetibili:
+  `mongo_data::mongo-flat-data` e `mongo_logs::mongo-flat-logs`;
+- il timestamp è comune ai due archivi flat;
+- gli archivi flat sono direttamente nella directory di destinazione, senza
+  sottodirectory per volume;
+- il file `.dvol-index.json` associa ogni archivio al volume Docker corretto;
+- il file indice viene scritto atomicamente e ha permessi `0644`;
+- gli archivi flat hanno permessi `0644` e non vengono sovrascritti in caso di
+  collisione;
+- `docker dvol backups <volume>` trova anche gli archivi flat tramite l’indice;
+- `docker dvol restore <volume> <basename>` risolve correttamente un archivio
+  flat tramite l’indice;
 - Mongo resta avviato per mantenere montati i bind-backed volumes;
 - `db.fsyncLock()` crea una finestra quiescente e applicativamente coerente;
 - `docker pause` blocca anche i writer di background durante la lettura;

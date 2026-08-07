@@ -33,6 +33,13 @@ type BackupOptions struct {
 	ArchiveName string
 	// Timestamp adds _ddmmyyyy_HHMMSS to ArchiveName (or the volume name).
 	Timestamp bool
+	// TimestampValue is an optional timestamp captured by the caller and
+	// reused for every archive in one operation. Empty means generate it when
+	// the archive name is built.
+	TimestampValue string
+	// SameDestination stores a single-volume archive directly in the backup
+	// destination instead of creating a directory named after the volume.
+	SameDestination bool
 }
 
 func (o BackupOptions) norm() BackupOptions {
@@ -49,7 +56,7 @@ func (o BackupOptions) Validate() error {
 			o.ArchiveName = strings.TrimSuffix(o.ArchiveName, suffix)
 		}
 		if o.ArchiveName == "" || o.ArchiveName == "." || o.ArchiveName == ".." ||
-			strings.ContainsAny(o.ArchiveName, `/\\`) {
+			strings.ContainsAny(o.ArchiveName, `/\\:`) {
 			return fmt.Errorf("invalid archive name %q (use a file name, not a path)", o.ArchiveName)
 		}
 	}

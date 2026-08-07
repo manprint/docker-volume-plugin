@@ -230,6 +230,45 @@ backup_mongo_volumes() {
 		|| fail "mongo_logs archive is not listed"
 }
 
+backup_flat_mongo_volumes() {
+	local compression="$1" destination="$2" output archive stamp
+	mkdir -p "$destination"
+	output="$("$DVOL_BIN" --destination "$destination" backup \
+		--compression "$compression" \
+		--archive-name mongo_data::mongo-flat-data \
+		--archive-name mongo_logs::mongo-flat-logs \
+		--same-destination --timestamp mongo_data mongo_logs)"
+	mapfile -t FLAT_ARCHIVES < <(printf '%s\n' "$output" | sed -n 's/^backed up .* -> //p')
+	[[ ${#FLAT_ARCHIVES[@]} -eq 2 ]] || fail "expected 2 flat backup archives, got ${#FLAT_ARCHIVES[@]}"
+	FLAT_DATA_ARCHIVE=""
+	FLAT_LOGS_ARCHIVE=""
+	for archive in "${FLAT_ARCHIVES[@]}"; do
+		assert_file "$archive"
+		[[ "$(dirname -- "$archive")" == "$destination" ]] || fail "archive is not flat: $archive"
+		[[ "$(stat -c '%a' -- "$archive")" == 644 ]] || fail "unexpected archive permissions: $archive"
+		case "$(basename -- "$archive")" in
+			mongo-flat-data_*) FLAT_DATA_ARCHIVE="$archive" ;;
+			mongo-flat-logs_*) FLAT_LOGS_ARCHIVE="$archive" ;;
+			*) fail "unexpected flat archive name: $archive" ;;
+		esac
+	done
+	[[ -n "$FLAT_DATA_ARCHIVE" && -n "$FLAT_LOGS_ARCHIVE" ]] || fail "missing flat Mongo archives"
+	stamp="$(basename -- "$FLAT_DATA_ARCHIVE")"
+	stamp="${stamp#mongo-flat-data_}"
+	stamp="${stamp%.tar.*}"
+	[[ "$(basename -- "$FLAT_LOGS_ARCHIVE")" == "mongo-flat-logs_${stamp}.tar."* ]] \
+		|| fail "flat archives do not share one timestamp"
+	[[ -f "$destination/.dvol-index.json" ]] || fail "flat backup metadata index is missing"
+	[[ "$(stat -c '%a' -- "$destination/.dvol-index.json")" == 644 ]] \
+		|| fail "unexpected flat metadata permissions"
+	"$DVOL_BIN" --destination "$destination" backups mongo_data \
+		| grep -F -- "$(basename -- "$FLAT_DATA_ARCHIVE")" >/dev/null \
+		|| fail "flat mongo_data archive is not listed"
+	"$DVOL_BIN" --destination "$destination" backups mongo_logs \
+		| grep -F -- "$(basename -- "$FLAT_LOGS_ARCHIVE")" >/dev/null \
+		|| fail "flat mongo_logs archive is not listed"
+}
+
 write_existing_target_sentinels() {
 	docker volume create mongo_data >/dev/null
 	docker volume create mongo_logs >/dev/null
@@ -251,6 +290,18 @@ restore_same_name_and_verify() {
 	write_existing_target_sentinels
 	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore mongo_data "$data_archive" >/dev/null
 	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore mongo_logs "$logs_archive" >/dev/null
+	assert_sentinels_removed
+	start_mongo "$mode" "$directory"
+	assert_mongo_data
+	stop_mongo "$mode" "$directory"
+	destroy_mongo "$mode" "$directory"
+}
+
+restore_same_name_from_flat_and_verify() {
+	local mode="$1" directory="$2" destination="$3" data_archive="$4" logs_archive="$5"
+	write_existing_target_sentinels
+	"$DVOL_BIN" --destination "$destination" restore mongo_data "$(basename -- "$data_archive")" >/dev/null
+	"$DVOL_BIN" --destination "$destination" restore mongo_logs "$(basename -- "$logs_archive")" >/dev/null
 	assert_sentinels_removed
 	start_mongo "$mode" "$directory"
 	assert_mongo_data
@@ -300,7 +351,7 @@ restore_missing_copies_and_verify() {
 run_case() {
 	local mode compression directory
 	local before_data before_logs after_data after_logs
-	local data_archive logs_archive
+	local data_archive logs_archive flat_directory
 	mode="$1"
 	compression="$2"
 	directory="$WORK_DIR/${mode}-${compression}"
@@ -320,6 +371,8 @@ run_case() {
 	backup_mongo_volumes "$compression"
 	data_archive="$DATA_ARCHIVE"
 	logs_archive="$LOGS_ARCHIVE"
+	flat_directory="$directory/flat-archives"
+	backup_flat_mongo_volumes "$compression" "$flat_directory"
 	after_data="$(volume_manifest mongo_data)"
 	after_logs="$(volume_manifest mongo_logs)"
 	assert_equal "$before_data" "$after_data" "mongo_data changed during backup"
@@ -329,7 +382,7 @@ run_case() {
 	stop_mongo "$mode" "$directory"
 
 	destroy_mongo "$mode" "$directory"
-	restore_same_name_and_verify "$mode" "$directory" "$data_archive" "$logs_archive"
+	restore_same_name_from_flat_and_verify "$mode" "$directory" "$flat_directory" "$FLAT_DATA_ARCHIVE" "$FLAT_LOGS_ARCHIVE"
 	restore_renamed_copies_and_verify "$data_archive" "$logs_archive" "${mode}_${compression}"
 	restore_missing_copies_and_verify "$data_archive" "$logs_archive" "${mode}_${compression}"
 }

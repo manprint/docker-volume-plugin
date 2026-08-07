@@ -75,9 +75,9 @@ docker volume inspect app \
     default: <root>/backups
 
 --destination <dir>
-    directory radice degli archivi; gli archivi dei singoli volumi sono
-    organizzati in <dir>/<volume>/;
-    default: <root>/backups
+	 directory radice degli archivi; gli archivi dei singoli volumi sono
+	 organizzati in <dir>/<volume>/;
+	 default: <root>/backups
 ```
 
 Il repository contiene solo gli archivi; non contiene i dati operativi dei
@@ -125,10 +125,12 @@ Opzioni di `backup`:
 ```text
 --compression <gzip|xz|zstd>  formato, default gzip
 --level <n>                   livello, 0 usa il default del formato
---archive-name <name>         nome base dell’archivio, senza percorso;
-                              valido con un solo volume
---name <name>                 alias di --archive-name
---timestamp                   aggiunge _ddmmyyyy_HHMMSS al nome
+--archive-name VALUE          flag ripetibile; con un volume: nome base;
+                              con più volumi: VOLUME::NOME
+--name VALUE                  alias di --archive-name
+--same-destination            salva gli archivi direttamente in <destination>;
+                              default: false, mantiene <destination>/<volume>/
+--timestamp                   aggiunge _ddmmyyyy_HHMMSS; default: false
 ```
 
 Per esempio, per ottenere un backup MongoDB nella directory richiesta con
@@ -153,8 +155,57 @@ Il formato `zstd` usa l’estensione `.tar.zst`; `.tar.zstd` indica lo stesso
 formato ma non è il suffisso generato dal programma. Se non si usa
 `--archive-name`, il nome base è quello del volume. Se non si usa
 `--timestamp`, resta il nome predefinito con timestamp ad alta precisione.
-Un nome personalizzato non può essere usato contemporaneamente per più
-volumi, per evitare collisioni.
+Per più volumi usare un mapping ripetibile. Tutti i volumi selezionati devono
+avere un mapping, i mapping duplicati vengono rifiutati e i nomi devono essere
+nomi file, non percorsi. I flag devono essere indicati prima dei volumi:
+
+```bash
+docker dvol backup \
+  --destination /home/ubuntu/stack_odoo \
+  --compression zstd \
+  --archive-name pg_data::postgres-odoo \
+  --archive-name filestore_data::filestore-odoo \
+  --same-destination \
+  --timestamp \
+  pg_data filestore_data
+```
+
+Con `--same-destination` il risultato è simile a:
+
+```text
+/home/ubuntu/stack_odoo/postgres-odoo_07082026_223010.tar.zst
+/home/ubuntu/stack_odoo/filestore-odoo_07082026_223010.tar.zst
+```
+
+Senza `--same-destination` gli stessi archivi vengono invece scritti in:
+
+```text
+/home/ubuntu/stack_odoo/pg_data/postgres-odoo_07082026_223010.tar.zst
+/home/ubuntu/stack_odoo/filestore_data/filestore-odoo_07082026_223010.tar.zst
+```
+
+Il timestamp viene calcolato una sola volta per l’intero comando. Con
+`--same-destination` i nomi archivio devono essere univoci; un archivio già
+esistente causa errore e non viene sovrascritto.
+
+La modalità flat mantiene la trasparenza dei comandi esistenti tramite il file
+di metadati persistente `.dvol-index.json`, aggiornato atomicamente. Perciò
+continuano a funzionare anche:
+
+```bash
+docker dvol --destination /home/ubuntu/stack_odoo backups pg_data
+docker dvol --destination /home/ubuntu/stack_odoo restore pg_data \
+  postgres-odoo_07082026_223010.tar.zst
+docker dvol --destination /home/ubuntu/stack_odoo restore pg_data
+```
+
+Il lock temporaneo dell’indice è `.dvol-index.lock`. Gli archivi flat già
+pubblicati vengono recuperati anche se il processo si interrompe durante
+l’aggiornamento dei metadati.
+
+I permessi predefiniti restano invariati: file archivio e metadati `0644`,
+directory create `0755`; owner e gruppo sono quelli dell’utente effettivo che
+esegue il comando (`root:root` se eseguito con `sudo`).
 
 Ripristinare l’ultimo archivio:
 
