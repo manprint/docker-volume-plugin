@@ -83,7 +83,7 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(bdir, fmt.Sprintf("%s-%s.tar.%s", name, ts(), opts.norm().ext()))
+	path := filepath.Join(bdir, archiveFilename(name, opts))
 	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
 		return addTreeTo(tw, source, "")
 	}); err != nil {
@@ -157,7 +157,7 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(outDir, fmt.Sprintf("%s-%s.tar.%s", prefix, ts(), opts.norm().ext()))
+	path := filepath.Join(outDir, archiveFilename(prefix, opts))
 	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
 		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
 		mb, err := json.Marshal(mf)
@@ -218,10 +218,13 @@ func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) er
 	if err := closeTar(tw, w, f, tmp); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	// Link publishes the completed file without replacing an existing archive.
+	// This matters for user-supplied names and second-resolution timestamps.
+	if err := os.Link(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
+	_ = os.Remove(tmp)
 	// The rename is atomic, but syncing the parent makes the new directory
 	// entry durable across a power loss on filesystems that support fsync.
 	if err := syncDir(filepath.Dir(path)); err != nil {
@@ -263,6 +266,22 @@ func (s *Store) ListArchives(dir string) ([]BackupInfo, error) {
 // ts returns a filesystem-safe timestamp. Nanosecond precision prevents two
 // backups landing in the same second from truncating each other.
 func ts() string { return time.Now().UTC().Format("20060102-150405.000000000") }
+
+func archiveFilename(defaultName string, opts BackupOptions) string {
+	base := defaultName
+	if opts.ArchiveName != "" {
+		base = opts.ArchiveName
+		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd"} {
+			base = strings.TrimSuffix(base, suffix)
+		}
+	}
+	if opts.Timestamp {
+		base += "_" + time.Now().Format("02012006_150405")
+	} else if opts.ArchiveName == "" {
+		base += "-" + ts()
+	}
+	return fmt.Sprintf("%s.tar.%s", base, opts.norm().ext())
+}
 
 func closeTar(tw *tar.Writer, w io.Closer, f *os.File, path string) error {
 	if err := tw.Close(); err != nil {

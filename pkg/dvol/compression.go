@@ -28,6 +28,11 @@ type BackupOptions struct {
 	// Level is the compression level; 0 means the format default.
 	// gzip: 1-9, xz: 0-9 presets, zstd: 1-22.
 	Level int
+	// ArchiveName is an optional archive name stem. The compression suffix is
+	// added automatically; a .tar.* suffix supplied by callers is accepted.
+	ArchiveName string
+	// Timestamp adds _ddmmyyyy_HHMMSS to ArchiveName (or the volume name).
+	Timestamp bool
 }
 
 func (o BackupOptions) norm() BackupOptions {
@@ -39,6 +44,15 @@ func (o BackupOptions) norm() BackupOptions {
 
 // Validate reports an error for an unsupported format or out-of-range level.
 func (o BackupOptions) Validate() error {
+	if o.ArchiveName != "" {
+		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd"} {
+			o.ArchiveName = strings.TrimSuffix(o.ArchiveName, suffix)
+		}
+		if o.ArchiveName == "" || o.ArchiveName == "." || o.ArchiveName == ".." ||
+			strings.ContainsAny(o.ArchiveName, `/\\`) {
+			return fmt.Errorf("invalid archive name %q (use a file name, not a path)", o.ArchiveName)
+		}
+	}
 	switch o.norm().Compression {
 	case CompressionGzip:
 		if o.Level < 0 || o.Level > 9 {

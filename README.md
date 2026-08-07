@@ -71,7 +71,12 @@ docker volume inspect app \
     default: ~/.local/share/docker-volume-backup
 
 --backup-dir <dir>
-    directory degli archivi;
+    directory radice degli archivi; alias storico di --destination;
+    default: <root>/backups
+
+--destination <dir>
+    directory radice degli archivi; gli archivi dei singoli volumi sono
+    organizzati in <dir>/<volume>/;
     default: <root>/backups
 ```
 
@@ -81,7 +86,13 @@ volumi Docker. Esempio:
 ```bash
 docker dvol --root "$HOME/docker-volume-backups" list
 docker dvol --root "$HOME/docker-volume-backups" backup app
+docker dvol --destination /home/ubuntu/dump-mongo-vol backup mongo_data
 ```
+
+Con l’ultimo comando l’archivio viene scritto in
+`/home/ubuntu/dump-mongo-vol/mongo_data/`. `--root` configura l’intero
+repository; `--destination` (o `--backup-dir`) configura direttamente la
+directory radice in cui vengono scritti gli archivi.
 
 ## Backup e restore di singoli volumi
 
@@ -114,7 +125,36 @@ Opzioni di `backup`:
 ```text
 --compression <gzip|xz|zstd>  formato, default gzip
 --level <n>                   livello, 0 usa il default del formato
+--archive-name <name>         nome base dell’archivio, senza percorso;
+                              valido con un solo volume
+--name <name>                 alias di --archive-name
+--timestamp                   aggiunge _ddmmyyyy_HHMMSS al nome
 ```
+
+Per esempio, per ottenere un backup MongoDB nella directory richiesta con
+nome leggibile e timestamp:
+
+```bash
+docker dvol backup \
+  --destination /home/ubuntu/dump-mongo-vol \
+  --compression zstd \
+  --archive-name mongodb-vol \
+  --timestamp \
+  mongo_data
+```
+
+Il risultato sarà simile a:
+
+```text
+/home/ubuntu/dump-mongo-vol/mongo_data/mongodb-vol_07082026_223010.tar.zst
+```
+
+Il formato `zstd` usa l’estensione `.tar.zst`; `.tar.zstd` indica lo stesso
+formato ma non è il suffisso generato dal programma. Se non si usa
+`--archive-name`, il nome base è quello del volume. Se non si usa
+`--timestamp`, resta il nome predefinito con timestamp ad alta precisione.
+Un nome personalizzato non può essere usato contemporaneamente per più
+volumi, per evitare collisioni.
 
 Ripristinare l’ultimo archivio:
 

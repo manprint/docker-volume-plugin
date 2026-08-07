@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -215,6 +216,38 @@ func TestCmdBackupCompression(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(store.VolumePath("web"), "data.txt"))
 	if err != nil || string(got) != "xz-data" {
 		t.Fatalf("expected xz-data, got %q err=%v", got, err)
+	}
+}
+
+func TestCmdBackupArchiveNameAndTimestamp(t *testing.T) {
+	store := newCLIStore(t)
+	if err := store.Create("mongo_data", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.VolumePath("mongo_data"), "data.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{store: store, docker: dockerForStore(store, "mongo_data")}
+	a.cmdBackup([]string{"--compression", "zstd", "--archive-name", "mongodb-vol", "--timestamp", "mongo_data"})
+
+	infos, err := store.ListBackups("mongo_data")
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("ListBackups: %+v err=%v", infos, err)
+	}
+	if !regexp.MustCompile(`^mongodb-vol_[0-9]{8}_[0-9]{6}\.tar\.zst$`).MatchString(infos[0].Name) {
+		t.Fatalf("unexpected timestamped archive name: %q", infos[0].Name)
+	}
+}
+
+func TestExtractGlobalFlagsDestination(t *testing.T) {
+	root, destination, args := extractGlobalFlags([]string{
+		"backup", "--destination", "/home/ubuntu/dump-mongo-vol", "mongo_data",
+	})
+	if root != "" || destination != "/home/ubuntu/dump-mongo-vol" {
+		t.Fatalf("unexpected global flags: root=%q destination=%q", root, destination)
+	}
+	if got := strings.Join(args, " "); got != "backup mongo_data" {
+		t.Fatalf("unexpected remaining args: %q", got)
 	}
 }
 

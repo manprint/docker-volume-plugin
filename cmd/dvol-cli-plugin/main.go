@@ -98,8 +98,7 @@ func printMetadata() {
 	fmt.Println(`{"SchemaVersion":"0.1.0","Vendor":"fabio","Version":"` + pluginVersion + `","ShortDescription":"Backup and restore Docker volumes (also from Docker Compose)"}`)
 }
 
-// extractGlobalFlags pulls --root <dir> / --root=<dir> and
-// --backup-dir <dir> / --backup-dir=<dir> out of args.
+// extractGlobalFlags pulls --root and the backup destination flags out of args.
 func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
 	out = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -119,6 +118,13 @@ func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
 			}
 		case strings.HasPrefix(a, "--backup-dir="):
 			backupDir = strings.TrimPrefix(a, "--backup-dir=")
+		case a == "--destination":
+			if i+1 < len(args) {
+				backupDir = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--destination="):
+			backupDir = strings.TrimPrefix(a, "--destination=")
 		default:
 			out = append(out, a)
 		}
@@ -199,21 +205,29 @@ func (a *app) cmdBackups(args []string) {
 	tw.Flush()
 }
 
-// cmdBackup: docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...
+// cmdBackup: docker dvol backup [options] <volume>...
 func (a *app) cmdBackup(args []string) {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
 	level := fs.Int("level", 0, "compression level (0 = format default)")
+	archiveName := ""
+	fs.StringVar(&archiveName, "archive-name", "", "archive name stem (one volume only; suffix is added automatically)")
+	fs.StringVar(&archiveName, "name", "", "alias for --archive-name")
+	includeTimestamp := false
+	fs.BoolVar(&includeTimestamp, "timestamp", false, "append _ddmmyyyy_HHMMSS to the archive name")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, ArchiveName: archiveName, Timestamp: includeTimestamp}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
 	names := expandNames(fs.Args())
 	if len(names) == 0 {
-		fail("usage: docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...")
+		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...")
+	}
+	if archiveName != "" && len(names) != 1 {
+		fail("--archive-name can be used only when backing up one volume")
 	}
 	for _, n := range names {
 		source, err := a.volumeSource(n)
@@ -282,19 +296,24 @@ func (a *app) restoreLatest(name string) error {
 	return nil
 }
 
-// cmdComposeBackup: docker dvol compose-backup [-f file] [-p project] [--compression c] [--level n]
+// cmdComposeBackup: docker dvol compose-backup [-f file] [-p project] [options]
 func (a *app) cmdComposeBackup(args []string) {
 	fs := flag.NewFlagSet("compose-backup", flag.ContinueOnError)
 	var files multiFlag
 	project := fs.String("p", "", "project name")
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
 	level := fs.Int("level", 0, "compression level (0 = format default)")
+	archiveName := ""
+	fs.StringVar(&archiveName, "archive-name", "", "archive name stem (suffix is added automatically)")
+	fs.StringVar(&archiveName, "name", "", "alias for --archive-name")
+	includeTimestamp := false
+	fs.BoolVar(&includeTimestamp, "timestamp", false, "append _ddmmyyyy_HHMMSS to the archive name")
 	fs.Var(&files, "f", "compose file (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
 
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, ArchiveName: archiveName, Timestamp: includeTimestamp}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
@@ -379,13 +398,13 @@ func (a *app) usage() {
 Usage:
   docker dvol list                        list volumes
   docker dvol backups <volume>            list backups of a volume
-  docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
+  docker dvol backup [--destination DIR] [--archive-name NAME] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
   docker dvol restore <volume>... [backup]  restore volumes (optional backup for a single volume)
   docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N]   backup all volumes of a compose project into one archive
   docker dvol compose-restore [-f file.yml] [-p project] [archive]  restore them
 
 Global flags: --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)
-            --backup-dir <dir>   backups directory (default <root>/backups)
+            --destination <dir>  backup destination (default <root>/backups; --backup-dir is an alias)
 
 `)
 }
