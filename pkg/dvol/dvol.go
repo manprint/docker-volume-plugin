@@ -1,5 +1,5 @@
-// Package dvol implements the core of the Docker volume plugin: a local
-// volume store plus backup/restore on the host filesystem.
+// Package dvol implements the archive repository and backup/restore logic for
+// Docker volumes, plus Docker Compose parsing.
 package dvol
 
 import (
@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	// DefaultRoot is the backing store location on the host. The plugin
-	// bind-mounts it at /data inside its rootfs.
+	// DefaultRoot is the fallback archive repository location. The CLI normally
+	// chooses a user-writable repository under the current user's home.
 	DefaultRoot = "/var/lib/dvol"
 
 	volumesDir = "volumes"
@@ -34,7 +34,7 @@ type Volume struct {
 	Size int64
 }
 
-// Store manages volumes on disk.
+// Store manages backup archives and the staging data used by backup/restore.
 type Store struct {
 	cfg Config
 }

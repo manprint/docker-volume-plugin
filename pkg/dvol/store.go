@@ -21,7 +21,7 @@ type meta struct {
 	Options   map[string]string `json:"options,omitempty"`
 }
 
-// NewStore returns a Store rooted at cfg.Root (DefaultRoot if empty).
+// NewStore returns an archive store rooted at cfg.Root (DefaultRoot if empty).
 func NewStore(cfg Config) (*Store, error) {
 	if cfg.Root == "" {
 		cfg.Root = DefaultRoot

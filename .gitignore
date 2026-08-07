@@ -4,14 +4,8 @@
 *.exe
 
 # Go build artifacts
-/dvol-plugin
-/dvol-ctl
 *.test
 *.out
-
-# Plugin build artifacts
-/plugin/rootfs/
-*.plugin
 
 # Editor / OS
 .vscode/

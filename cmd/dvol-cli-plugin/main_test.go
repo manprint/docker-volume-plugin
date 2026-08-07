@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,14 @@ func newCLIStore(t *testing.T) *dvol.Store {
 type fakeDockerVolumes struct {
 	volumes           map[string]dockerVolumeInfo
 	createMountpoints map[string]string
+}
+
+func dockerForStore(store *dvol.Store, names ...string) *fakeDockerVolumes {
+	volumes := make(map[string]dockerVolumeInfo, len(names))
+	for _, name := range names {
+		volumes[name] = dockerVolumeInfo{Name: name, Driver: "local", Mountpoint: store.VolumePath(name)}
+	}
+	return &fakeDockerVolumes{volumes: volumes, createMountpoints: map[string]string{}}
 }
 
 func (f *fakeDockerVolumes) List() ([]dockerVolumeInfo, error) {
@@ -62,12 +71,12 @@ func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
 	}, createMountpoints: map[string]string{}}
 	a := &app{store: store, docker: fake}
 
-	source, managedByStore, err := a.volumeSource("legacy")
+	source, err := a.volumeSource("legacy")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if source != mountpoint || managedByStore {
-		t.Fatalf("unexpected Docker source: %q managed=%v", source, managedByStore)
+	if source != mountpoint {
+		t.Fatalf("unexpected Docker source: %q", source)
 	}
 	archive, err := store.BackupSourceWithOptions("legacy", source, dvol.BackupOptions{})
 	if err != nil {
@@ -85,6 +94,20 @@ func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(mountpoint, "changed.txt")); !os.IsNotExist(err) {
 		t.Fatalf("changed Docker volume data should have been replaced")
+	}
+}
+
+func TestVolumeSourceDoesNotUseArchiveRepositoryAsDockerVolume(t *testing.T) {
+	store := newCLIStore(t)
+	if err := store.Create("orphan", nil); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{store: store, docker: &fakeDockerVolumes{
+		volumes:           map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{},
+	}}
+	if _, err := a.volumeSource("orphan"); !errors.Is(err, errDockerVolumeNotFound) {
+		t.Fatalf("expected Docker lookup failure, got %v", err)
 	}
 }
 
@@ -137,7 +160,7 @@ func TestCmdRestoreSpecificBackup(t *testing.T) {
 	first := write("v1")
 	write("v2")
 
-	a := &app{store: store}
+	a := &app{store: store, docker: dockerForStore(store, "web")}
 	a.cmdRestore([]string{"web", filepath.Base(first)})
 
 	got, err := os.ReadFile(filepath.Join(store.VolumePath("web"), "data.txt"))
@@ -158,7 +181,7 @@ func TestCmdRestoreGlobSelector(t *testing.T) {
 	if _, err := store.Backup("web"); err != nil {
 		t.Fatal(err)
 	}
-	a := &app{store: store}
+	a := &app{store: store, docker: dockerForStore(store, "web")}
 	a.cmdRestore([]string{"web", "*.tar.gz"})
 	got, err := os.ReadFile(filepath.Join(store.VolumePath("web"), "data.txt"))
 	if err != nil || string(got) != "v1" {
@@ -175,7 +198,7 @@ func TestCmdBackupCompression(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(store.VolumePath("web"), "data.txt"), []byte("xz-data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a := &app{store: store}
+	a := &app{store: store, docker: dockerForStore(store, "web")}
 	a.cmdBackup([]string{"--compression", "xz", "--level", "6", "web"})
 	infos, err := store.ListBackups("web")
 	if err != nil || len(infos) != 1 {
@@ -208,7 +231,7 @@ func TestCmdComposeBackupCompression(t *testing.T) {
 	if err := os.WriteFile(cf, []byte("name: myproj\nvolumes:\n  data:\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a := &app{store: store}
+	a := &app{store: store, docker: dockerForStore(store, "myproj_data")}
 	a.cmdComposeBackup([]string{"-f", cf, "--compression", "zstd", "--level", "9"})
 	bundles, err := store.ListArchives(store.BundleDir())
 	if err != nil || len(bundles) != 1 {
@@ -240,7 +263,7 @@ func TestCmdRestoreMultipleVolumes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a := &app{store: store}
+	a := &app{store: store, docker: dockerForStore(store, "web", "db")}
 	a.cmdRestore([]string{"web", "db"})
 	for _, n := range []string{"web", "db"} {
 		got, err := os.ReadFile(filepath.Join(store.VolumePath(n), "data.txt"))
