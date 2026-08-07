@@ -154,7 +154,9 @@ func (a *app) cmdBackup(args []string) {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
 	level := fs.Int("level", 0, "compression level (0 = format default)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
 	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
 	if err := opts.Validate(); err != nil {
 		fail(err)
@@ -240,7 +242,9 @@ func (a *app) cmdComposeBackup(args []string) {
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
 	level := fs.Int("level", 0, "compression level (0 = format default)")
 	fs.Var(&files, "f", "compose file (repeatable)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
 
 	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
 	if err := opts.Validate(); err != nil {
@@ -272,7 +276,9 @@ func (a *app) cmdComposeRestore(args []string) {
 	var files multiFlag
 	project := fs.String("p", "", "project name")
 	fs.Var(&files, "f", "compose file (repeatable)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
 	rest := fs.Args()
 
 	path, err := resolveComposeFile(files)

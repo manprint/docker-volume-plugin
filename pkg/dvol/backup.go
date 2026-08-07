@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -219,7 +220,9 @@ func closeTar(tw *tar.Writer, w io.Closer, f *os.File, path string) error {
 
 // addTreeTo writes the volume root entry followed by every file under dir.
 // With prefix "" the root entry is "." (a plain volume backup); otherwise
-// entries are prefixed with "<prefix>/" (a bundle).
+// entries are prefixed with "<prefix>/" (a bundle). Hard-linked files are
+// written once plus TypeLink entries, preserving inode sharing in both the
+// plain and the bundle layout.
 func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 	rootInfo, err := os.Stat(dir)
 	if err != nil {
@@ -234,6 +237,7 @@ func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 	if err := tw.WriteHeader(dirHeader(rootName, rootInfo)); err != nil {
 		return err
 	}
+	seen := map[[2]uint64]string{} // (dev,ino) -> first archive name
 	return filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -251,6 +255,23 @@ func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 			link, err = os.Readlink(p)
 			if err != nil {
 				return err
+			}
+		}
+		if info.Mode().IsRegular() {
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+				key := [2]uint64{uint64(st.Dev), uint64(st.Ino)}
+				if first, ok := seen[key]; ok {
+					hdr, err := tar.FileInfoHeader(info, "")
+					if err != nil {
+						return err
+					}
+					hdr.Name = name
+					hdr.Typeflag = tar.TypeLink
+					hdr.Linkname = first
+					hdr.Mode |= specialModeBits(info.Mode())
+					return tw.WriteHeader(hdr)
+				}
+				seen[key] = name
 			}
 		}
 		hdr, err := tar.FileInfoHeader(info, link)
@@ -323,10 +344,15 @@ func (s *Store) Restore(name, backupPath string) error {
 		return err
 	}
 	defer os.RemoveAll(staging)
+	n := 0
 	if err := extractTarTo(staging, backupPath, func(name string) (string, bool, error) {
+		n++
 		return name, true, nil
 	}); err != nil {
 		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("backup archive %q contains no entries", backupPath)
 	}
 	return replaceStage(staging, vdir)
 }
@@ -369,8 +395,25 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 	if err != nil {
 		return err
 	}
+	if len(entries) == 0 {
+		return fmt.Errorf("bundle contains no volumes matching the request")
+	}
+	// Validate every staged volume root BEFORE touching any live volume: a
+	// single malformed volume (e.g. root swapped into a symlink by a hostile
+	// archive) must not leave the already-staged volumes partially restored.
+	staged := make([]string, 0, len(entries))
 	for _, e := range entries {
-		vol := e.Name()
+		dir := filepath.Join(staging, e.Name())
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("refusing to restore volume %q: archive entry is not a directory", e.Name())
+		}
+		staged = append(staged, e.Name())
+	}
+	for _, vol := range staged {
 		if err := s.ensureVolume(vol); err != nil {
 			return err
 		}
@@ -381,13 +424,37 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 	return nil
 }
 
-// replaceStage atomically swaps the fully-extracted staging directory into
-// target, replacing whatever was there.
+// replaceStage swaps the fully-extracted staging directory into target. The
+// staging root is verified to be a real directory: an archive entry turning
+// it into a symlink refuses the swap. The previous target is kept under a
+// backup name until the swap completes, so a failed rename (or a crash within
+// replaceStage) leaves the old data recoverable instead of deleting it.
 func replaceStage(staging, target string) error {
-	if err := os.RemoveAll(target); err != nil {
+	fi, err := os.Lstat(staging)
+	if err != nil {
 		return err
 	}
-	return os.Rename(staging, target)
+	if !fi.IsDir() {
+		return fmt.Errorf("refusing to replace volume with non-directory %q (entry escaped the archive?)", staging)
+	}
+	backup := target + ".dvol-old"
+	if _, err := os.Lstat(target); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		// target already gone (e.g. user deleted the data dir while keeping
+		// the metadata): nothing to preserve, just move the staging in place.
+		return os.Rename(staging, target)
+	}
+	os.RemoveAll(backup)
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(staging, target); err != nil {
+		os.Rename(backup, target) // roll back: target is still valid
+		return err
+	}
+	return os.RemoveAll(backup)
 }
 
 // extractTarTo streams the entries of a backup archive into dir. filter maps
@@ -456,10 +523,14 @@ type fileMeta struct {
 }
 
 func (m fileMeta) apply() error {
-	// special bits (setuid/setgid/sticky) only take effect via os.Chmod, not
-	// through OpenFile's create mode.
-	if err := os.Chmod(m.path, m.mode); err != nil {
-		return err
+	if !m.isLink {
+		// special bits (setuid/setgid/sticky) only take effect via os.Chmod,
+		// not through OpenFile's create mode. Symlinks are skipped: on Linux
+		// symlink permission bits are ignored and os.Chmod follows the link,
+		// so chmodding a symlink would modify its target outside the volume.
+		if err := os.Chmod(m.path, m.mode); err != nil {
+			return err
+		}
 	}
 	if m.isLink {
 		if err := os.Lchown(m.path, m.uid, m.gid); err != nil {
@@ -550,6 +621,9 @@ func extractEntry(hdr *tar.Header, tr *tar.Reader, target, base string) error {
 			return err
 		}
 	case tar.TypeSymlink:
+		if filepath.Clean(target) == filepath.Clean(base) {
+			return fmt.Errorf("refusing to extract symlink at volume root %q", hdr.Name)
+		}
 		if err := checkNoSymlinkAncestors(base, filepath.Dir(target)); err != nil {
 			return err
 		}
