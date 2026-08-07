@@ -218,15 +218,27 @@ sudo docker dvol --root /srv/docker-volume-backups backup app
 ## Sviluppo e test
 
 ```bash
+cd /percorso/del/repository/docker-volume-plugin
 make build
 make test
 make lint
 make e2e
+sudo make acceptance
 make clean
 ```
 
-I test coprono backup read-only, restore atomico, rollback, compressione,
-bundle Compose, interruzioni e gestione di mountpoint Docker.
+Il target va eseguito dalla directory root del repository, non da
+`test/acceptance/`. In alternativa, da una sottodirectory usare
+`sudo make -C ../.. acceptance`.
+
+`make acceptance` esegue gli scenari PostgreSQL e Odoo con tutte le
+compressioni (`gzip`, `xz`, `zstd`). Richiede un Docker Engine operativo,
+permessi sui mountpoint dei volumi e può scaricare le immagini di test. Lo
+script rimuove al termine container, volumi, reti Compose, repository
+temporaneo e le immagini scaricate esclusivamente dalla suite.
+
+I test unitari coprono backup read-only, restore atomico, rollback,
+compressione, bundle Compose, interruzioni e gestione di mountpoint Docker.
 
 ## Layout
 

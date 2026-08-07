@@ -2,7 +2,7 @@ GO          ?= go
 CLI_PLUGIN  = docker-dvol-linux
 BIN         = bin/dvol-cli-plugin bin/$(CLI_PLUGIN)
 
-.PHONY: all build test lint e2e cli-plugin-build cli-plugin-install clean
+.PHONY: all build test lint e2e acceptance cli-plugin-build cli-plugin-install clean
 
 all: build
 
@@ -18,6 +18,12 @@ test:
 ## e2e: run the backup/restore smoke test
 e2e: build
 	./test/e2e.sh
+
+## acceptance: run the full PostgreSQL and Odoo Docker acceptance scenarios
+## Build first as the normal user; only the acceptance run needs privileges.
+acceptance:
+	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance'" >&2; exit 1; }
+	./test/acceptance_e2e.sh
 
 ## lint: go vet
 lint:
