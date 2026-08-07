@@ -1,5 +1,5 @@
 GO          ?= go
-CLI_PLUGIN  = docker-dvol-linux
+CLI_PLUGIN  = docker-dvol
 BIN         = bin/dvol-cli-plugin bin/$(CLI_PLUGIN)
 
 .PHONY: all build test lint e2e acceptance acceptance-mongo cli-plugin-build cli-plugin-install clean
@@ -24,9 +24,9 @@ e2e: build
 acceptance:
 	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance'" >&2; exit 1; }
 	@mkdir -p "$(HOME)/.docker/cli-plugins"
+	@rm -f "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
 	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol"
-	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
-	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol" "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
+	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol"
 	@echo "Acceptance CLI plugin: $(HOME)/.docker/cli-plugins/docker-dvol"
 	./test/acceptance_e2e.sh
 	./test/acceptance_mongo_e2e.sh
@@ -37,9 +37,9 @@ acceptance:
 acceptance-mongo:
 	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance-mongo'" >&2; exit 1; }
 	@mkdir -p "$(HOME)/.docker/cli-plugins"
+	@rm -f "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
 	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol"
-	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
-	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol" "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
+	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol"
 	./test/acceptance_mongo_e2e.sh
 	DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
 
@@ -53,9 +53,9 @@ cli-plugin-build: build
 ## cli-plugin-install: install `docker dvol` for the current user
 cli-plugin-install: build
 	mkdir -p $(HOME)/.docker/cli-plugins
+	rm -f $(HOME)/.docker/cli-plugins/docker-dvol-linux
 	cp bin/dvol-cli-plugin $(HOME)/.docker/cli-plugins/docker-dvol
-	cp bin/dvol-cli-plugin $(HOME)/.docker/cli-plugins/docker-dvol-linux
-	chmod +x $(HOME)/.docker/cli-plugins/docker-dvol $(HOME)/.docker/cli-plugins/docker-dvol-linux
+	chmod +x $(HOME)/.docker/cli-plugins/docker-dvol
 	@echo "installed: ~/.docker/cli-plugins/docker-dvol (try: docker dvol --help)"
 
 ## clean: remove build artifacts

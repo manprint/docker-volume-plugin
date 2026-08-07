@@ -33,10 +33,12 @@ make cli-plugin-install
 docker dvol --help
 ```
 
-Il plugin viene installato in `~/.docker/cli-plugins/docker-dvol`. Per
-aggiornarlo, ripetere `make build` e `make cli-plugin-install`.
+Il plugin viene installato in `~/.docker/cli-plugins/docker-dvol`. Questo è un
+Docker CLI plugin, quindi il nome del file è significativo; non devono esserci
+copie con suffissi come `docker-dvol-linux`. Per aggiornarlo, ripetere `make
+build` e `make cli-plugin-install`.
 
-Non è necessario installare o abilitare un Docker managed plugin. I volumi
+Non è necessario installare o abilitare un Docker Engine managed plugin. I volumi
 restano volumi Docker normali, creati per esempio con:
 
 ```bash
