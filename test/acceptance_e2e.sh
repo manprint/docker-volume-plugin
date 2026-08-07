@@ -15,6 +15,21 @@ readonly SCRIPT_DIR PROJECT_ROOT WORK_DIR
 readonly ARCHIVE_ROOT="$WORK_DIR/archives"
 readonly ODOO_COMPOSE="$SCRIPT_DIR/acceptance/odoo-compose.yaml"
 readonly DVOL_BIN="${DVOL_BIN:-$PROJECT_ROOT/bin/dvol-cli-plugin}"
+readonly DVOL_MODE="${DVOL_MODE:-direct}"
+
+dvol_cmd() {
+	case "$DVOL_MODE" in
+		direct)
+			"$DVOL_BIN" "$@"
+			;;
+		docker)
+			docker dvol "$@"
+			;;
+		*)
+			fail "unsupported DVOL_MODE: $DVOL_MODE (expected direct or docker)"
+			;;
+	esac
+}
 
 declare -a DOWNLOADED_IMAGES=()
 declare -a CREATED_CONTAINERS=()
@@ -145,7 +160,7 @@ assert_archive_contains() {
 
 backup_single_volume() {
 	local volume="$1" compression="$2" archive
-	archive="$("$DVOL_BIN" --root "$ARCHIVE_ROOT" backup --compression "$compression" "$volume" \
+	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" "$volume" \
 		| sed -n 's/^backed up .* -> //p')"
 	[[ -n "$archive" ]] || fail "backup did not report an archive for $volume"
 	assert_file "$archive"
@@ -191,13 +206,13 @@ run_postgres_scenario() {
 
 	assert_archive_contains "$archive" "PG_VERSION"
 	assert_archive_contains "$archive" "base/"
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" backups "$volume" | grep -Fq -- "$(basename "$archive")" \
+	dvol_cmd --root "$ARCHIVE_ROOT" backups "$volume" | grep -Fq -- "$(basename "$archive")" \
 		|| fail "backup is not listed by docker dvol backups"
 
 	docker rm "$container" >/dev/null
 	docker volume rm "$volume" >/dev/null
 
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore "$volume" "$archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$volume" "$archive" >/dev/null
 	docker run -d --name "$container" \
 		-e POSTGRES_PASSWORD=acceptance \
 		-e POSTGRES_DB=acceptance \
@@ -260,7 +275,7 @@ run_odoo_scenario() {
 	docker compose -p "$project" -f "$ODOO_COMPOSE" stop >/dev/null
 	before_db="$(volume_manifest "$db_volume")"
 	before_odoo="$(volume_manifest "$odoo_volume")"
-	archive="$("$DVOL_BIN" --root "$ARCHIVE_ROOT" compose-backup -f "$ODOO_COMPOSE" -p "$project" \
+	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" compose-backup -f "$ODOO_COMPOSE" -p "$project" \
 			--compression "$compression" | sed -n 's/^backed up .* -> //p')"
 	[[ -n "$archive" ]] || fail "Compose backup did not report an archive"
 	assert_file "$archive"
@@ -277,7 +292,7 @@ run_odoo_scenario() {
 	! docker volume inspect "$db_volume" >/dev/null 2>&1 || fail "database volume survived compose down -v"
 	! docker volume inspect "$odoo_volume" >/dev/null 2>&1 || fail "filestore volume survived compose down -v"
 
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" compose-restore -f "$ODOO_COMPOSE" -p "$project" "$archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" compose-restore -f "$ODOO_COMPOSE" -p "$project" "$archive" >/dev/null
 	docker volume inspect "$db_volume" >/dev/null
 	docker volume inspect "$odoo_volume" >/dev/null
 	after_db="$(volume_manifest "$db_volume")"
@@ -297,7 +312,19 @@ main() {
 	require_command curl
 	require_command python3
 	require_command tar
-	[[ -x "$DVOL_BIN" ]] || fail "build the CLI plugin first: $DVOL_BIN"
+	case "$DVOL_MODE" in
+		direct)
+			[[ -x "$DVOL_BIN" ]] || fail "build the CLI plugin first: $DVOL_BIN"
+			;;
+		docker)
+		docker dvol --help >/dev/null 2>&1 \
+			|| fail "the installed docker dvol CLI plugin is unavailable"
+			;;
+		*)
+			fail "unsupported DVOL_MODE: $DVOL_MODE (expected direct or docker)"
+			;;
+	esac
+	echo "Acceptance dvol mode: $DVOL_MODE"
 	[[ "$(id -u)" == 0 ]] || fail "run make acceptance as root so Docker volume mountpoints can be verified"
 	docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is required"
 	docker_root="$(docker info --format '{{.DockerRootDir}}')"

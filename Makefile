@@ -19,18 +19,29 @@ test:
 e2e: build
 	./test/e2e.sh
 
-## acceptance: run the full PostgreSQL and Odoo Docker acceptance scenarios
+## acceptance: run all acceptance suites through the binary and docker dvol
 ## Build first as the normal user; only the acceptance run needs privileges.
-## acceptance: run the PostgreSQL/Odoo and MongoDB Docker acceptance suites
 acceptance:
 	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance'" >&2; exit 1; }
+	@mkdir -p "$(HOME)/.docker/cli-plugins"
+	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol"
+	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
+	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol" "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
+	@echo "Acceptance CLI plugin: $(HOME)/.docker/cli-plugins/docker-dvol"
 	./test/acceptance_e2e.sh
 	./test/acceptance_mongo_e2e.sh
+	DVOL_MODE=docker ./test/acceptance_e2e.sh
+	DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
 
-## acceptance-mongo: run the MongoDB Compose/startup-script acceptance matrix
+## acceptance-mongo: run the MongoDB matrix through both client paths
 acceptance-mongo:
 	@test -x bin/dvol-cli-plugin || { echo "run 'make build' before 'sudo make acceptance-mongo'" >&2; exit 1; }
+	@mkdir -p "$(HOME)/.docker/cli-plugins"
+	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol"
+	@cp bin/dvol-cli-plugin "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
+	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol" "$(HOME)/.docker/cli-plugins/docker-dvol-linux"
 	./test/acceptance_mongo_e2e.sh
+	DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
 
 ## lint: go vet
 lint:

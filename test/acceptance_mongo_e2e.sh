@@ -12,7 +12,22 @@ ARCHIVE_ROOT="$WORK_DIR/archives"
 MONGO_COMPOSE="$SCRIPT_DIR/acceptance/mongo-compose.yaml"
 MONGO_START="$SCRIPT_DIR/acceptance/script-start.mongo.sh"
 DVOL_BIN="${DVOL_BIN:-$PROJECT_ROOT/bin/dvol-cli-plugin}"
-readonly SCRIPT_DIR PROJECT_ROOT WORK_DIR ARCHIVE_ROOT MONGO_COMPOSE MONGO_START DVOL_BIN
+DVOL_MODE="${DVOL_MODE:-direct}"
+readonly SCRIPT_DIR PROJECT_ROOT WORK_DIR ARCHIVE_ROOT MONGO_COMPOSE MONGO_START DVOL_BIN DVOL_MODE
+
+dvol_cmd() {
+	case "$DVOL_MODE" in
+		direct)
+			"$DVOL_BIN" "$@"
+			;;
+		docker)
+			docker dvol "$@"
+			;;
+		*)
+			fail "unsupported DVOL_MODE: $DVOL_MODE (expected direct or docker)"
+			;;
+	esac
+}
 
 declare -a DOWNLOADED_IMAGES=()
 declare -a CREATED_VOLUMES=()
@@ -204,7 +219,7 @@ unpause_mongo_after_backup() {
 
 backup_mongo_volumes() {
 	local compression="$1" output archive
-	output="$("$DVOL_BIN" --root "$ARCHIVE_ROOT" backup --compression "$compression" mongo_data mongo_logs)"
+	output="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" mongo_data mongo_logs)"
 	mapfile -t ARCHIVES < <(printf '%s\n' "$output" | sed -n 's/^backed up .* -> //p')
 	[[ ${#ARCHIVES[@]} -eq 2 ]] || fail "expected 2 backup archives, got ${#ARCHIVES[@]}"
 	DATA_ARCHIVE=""
@@ -222,10 +237,10 @@ backup_mongo_volumes() {
 	assert_archive_matches "$DATA_ARCHIVE" '(^|/)WiredTiger(\.|$)'
 	assert_archive_contains "$LOGS_ARCHIVE" mongod.log
 	assert_archive_contains "$LOGS_ARCHIVE" acceptance-marker.log
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" backups mongo_data \
+	dvol_cmd --root "$ARCHIVE_ROOT" backups mongo_data \
 		| grep -F -- "$(basename "$DATA_ARCHIVE")" >/dev/null \
 		|| fail "mongo_data archive is not listed"
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" backups mongo_logs \
+	dvol_cmd --root "$ARCHIVE_ROOT" backups mongo_logs \
 		| grep -F -- "$(basename "$LOGS_ARCHIVE")" >/dev/null \
 		|| fail "mongo_logs archive is not listed"
 }
@@ -233,7 +248,7 @@ backup_mongo_volumes() {
 backup_flat_mongo_volumes() {
 	local compression="$1" destination="$2" output archive stamp
 	mkdir -p "$destination"
-	output="$("$DVOL_BIN" --destination "$destination" backup \
+	output="$(dvol_cmd --destination "$destination" backup \
 		--compression "$compression" \
 		--archive-name mongo_data::mongo-flat-data \
 		--archive-name mongo_logs::mongo-flat-logs \
@@ -261,10 +276,10 @@ backup_flat_mongo_volumes() {
 	[[ -f "$destination/.dvol-index.json" ]] || fail "flat backup metadata index is missing"
 	[[ "$(stat -c '%a' -- "$destination/.dvol-index.json")" == 644 ]] \
 		|| fail "unexpected flat metadata permissions"
-	"$DVOL_BIN" --destination "$destination" backups mongo_data \
+	dvol_cmd --destination "$destination" backups mongo_data \
 		| grep -F -- "$(basename -- "$FLAT_DATA_ARCHIVE")" >/dev/null \
 		|| fail "flat mongo_data archive is not listed"
-	"$DVOL_BIN" --destination "$destination" backups mongo_logs \
+	dvol_cmd --destination "$destination" backups mongo_logs \
 		| grep -F -- "$(basename -- "$FLAT_LOGS_ARCHIVE")" >/dev/null \
 		|| fail "flat mongo_logs archive is not listed"
 }
@@ -288,8 +303,8 @@ assert_sentinels_removed() {
 restore_same_name_and_verify() {
 	local mode="$1" directory="$2" data_archive="$3" logs_archive="$4"
 	write_existing_target_sentinels
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore mongo_data "$data_archive" >/dev/null
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore mongo_logs "$logs_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore mongo_data "$data_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore mongo_logs "$logs_archive" >/dev/null
 	assert_sentinels_removed
 	start_mongo "$mode" "$directory"
 	assert_mongo_data
@@ -300,8 +315,8 @@ restore_same_name_and_verify() {
 restore_same_name_from_flat_and_verify() {
 	local mode="$1" directory="$2" destination="$3" data_archive="$4" logs_archive="$5"
 	write_existing_target_sentinels
-	"$DVOL_BIN" --destination "$destination" restore mongo_data "$(basename -- "$data_archive")" >/dev/null
-	"$DVOL_BIN" --destination "$destination" restore mongo_logs "$(basename -- "$logs_archive")" >/dev/null
+	dvol_cmd --destination "$destination" restore mongo_data "$(basename -- "$data_archive")" >/dev/null
+	dvol_cmd --destination "$destination" restore mongo_logs "$(basename -- "$logs_archive")" >/dev/null
 	assert_sentinels_removed
 	start_mongo "$mode" "$directory"
 	assert_mongo_data
@@ -330,8 +345,8 @@ restore_renamed_copies_and_verify() {
 	docker volume create "$data_copy" >/dev/null
 	docker volume create "$logs_copy" >/dev/null
 	CREATED_VOLUMES+=("$data_copy" "$logs_copy")
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore "$data_copy" "$data_archive" >/dev/null
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore "$logs_copy" "$logs_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$data_copy" "$data_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$logs_copy" "$logs_archive" >/dev/null
 	probe_restored_copy "$data_copy" "$logs_copy"
 	docker volume rm -f "$data_copy" "$logs_copy" >/dev/null
 }
@@ -342,8 +357,8 @@ restore_missing_copies_and_verify() {
 	! docker volume inspect "$data_copy" >/dev/null 2>&1 || fail "test target already exists: $data_copy"
 	! docker volume inspect "$logs_copy" >/dev/null 2>&1 || fail "test target already exists: $logs_copy"
 	CREATED_VOLUMES+=("$data_copy" "$logs_copy")
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore "$data_copy" "$data_archive" >/dev/null
-	"$DVOL_BIN" --root "$ARCHIVE_ROOT" restore "$logs_copy" "$logs_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$data_copy" "$data_archive" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$logs_copy" "$logs_archive" >/dev/null
 	probe_restored_copy "$data_copy" "$logs_copy"
 	docker volume rm -f "$data_copy" "$logs_copy" >/dev/null
 }
@@ -391,7 +406,19 @@ preflight() {
 	command -v docker >/dev/null 2>&1 || fail "Docker is required"
 	command -v tar >/dev/null 2>&1 || fail "tar is required"
 	command -v python3 >/dev/null 2>&1 || fail "python3 is required"
-	[[ -x "$DVOL_BIN" ]] || fail "build the CLI plugin first: $DVOL_BIN"
+	case "$DVOL_MODE" in
+		direct)
+			[[ -x "$DVOL_BIN" ]] || fail "build the CLI plugin first: $DVOL_BIN"
+			;;
+		docker)
+		docker dvol --help >/dev/null 2>&1 \
+			|| fail "the installed docker dvol CLI plugin is unavailable"
+			;;
+		*)
+			fail "unsupported DVOL_MODE: $DVOL_MODE (expected direct or docker)"
+			;;
+	esac
+	echo "Mongo acceptance dvol mode: $DVOL_MODE"
 	[[ "$(id -u)" == 0 ]] || fail "run this suite as root"
 	docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is required"
 	docker info >/dev/null 2>&1 || fail "Docker Engine is unavailable"

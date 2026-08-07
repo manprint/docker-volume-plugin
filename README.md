@@ -324,14 +324,27 @@ Il target va eseguito dalla directory root del repository, non da
 `sudo make -C ../.. acceptance`.
 
 `make acceptance` esegue gli scenari PostgreSQL e Odoo con tutte le
-compressioni (`gzip`, `xz`, `zstd`). Richiede un Docker Engine operativo,
-permessi sui mountpoint dei volumi e può scaricare le immagini di test. Lo
-script rimuove al termine container, volumi, reti Compose, repository
-temporaneo e le immagini scaricate esclusivamente dalla suite.
+compressioni (`gzip`, `xz`, `zstd`) due volte: prima usando il binario
+direttamente e poi usando realmente il comando installato `docker dvol`.
+Prima dell’esecuzione copia il binario CLI in
+`$HOME/.docker/cli-plugins/docker-dvol` dell’utente effettivo (quindi in
+`/root/.docker/cli-plugins/` quando viene lanciato con `sudo`). Richiede un
+Docker Engine operativo, permessi sui mountpoint dei volumi e può scaricare le
+immagini di test. Lo script rimuove al termine container, volumi, reti Compose,
+repository temporaneo e le immagini scaricate esclusivamente dalla suite.
 
-`make acceptance-mongo` esegue inoltre la matrice MongoDB basata sui file
+Per eseguire uno script singolarmente, `DVOL_MODE=direct` è il default;
+`DVOL_MODE=docker` forza il passaggio attraverso il plugin installato:
+
+```bash
+sudo DVOL_MODE=docker ./test/acceptance_e2e.sh
+sudo DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
+```
+
+`make acceptance-mongo` esegue la stessa matrice MongoDB in entrambe le
+modalità. La matrice è basata sui file
 `test/acceptance/mongo-compose.yaml` e
-`test/acceptance/script-start.mongo.sh`. La matrice dettagliata è in
+`test/acceptance/script-start.mongo.sh`; il dettaglio è in
 `test/acceptance/mongo_test_matrix.md`.
 
 I test unitari coprono backup read-only, restore atomico, rollback,
