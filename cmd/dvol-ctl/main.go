@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/fabio/dvol/pkg/dvol"
@@ -13,6 +15,7 @@ import (
 
 func main() {
 	root := flag.String("root", dvol.DefaultRoot, "backing store directory")
+	backupDir := flag.String("backup-dir", "", "backups directory (default <root>/backups)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -22,7 +25,7 @@ func main() {
 	}
 	cmd, args := flag.Arg(0), flag.Args()[1:]
 
-	store, err := dvol.NewStore(dvol.Config{Root: *root})
+	store, err := dvol.NewStore(dvol.Config{Root: *root, BackupsDir: *backupDir})
 	if err != nil {
 		fatal(err)
 	}
@@ -51,11 +54,15 @@ func main() {
 			fmt.Printf("removed %s\n", name)
 		}
 	case "backup":
-		if len(args) < 1 {
-			fatal("usage: dvol-ctl backup <volume>")
+		opts, names, err := backupOpts(args)
+		if err != nil {
+			fatal(err)
 		}
-		for _, name := range args {
-			p, err := store.Backup(name)
+		if len(names) < 1 {
+			fatal("usage: dvol-ctl backup [--compression gzip|xz|zstd] [--level N] <volume>...")
+		}
+		for _, name := range names {
+			p, err := store.BackupWithOptions(name, opts)
 			if err != nil {
 				fatal(err)
 			}
@@ -75,6 +82,48 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// backupOpts parses --compression/--level from backup args, returning the
+// options and the remaining volume names.
+func backupOpts(args []string) (dvol.BackupOptions, []string, error) {
+	opts := dvol.BackupOptions{Compression: "gzip"}
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--compression":
+			i++
+			if i >= len(args) {
+				return opts, nil, fmt.Errorf("--compression requires a value (gzip, xz, zstd)")
+			}
+			opts.Compression = dvol.Compression(args[i])
+		case strings.HasPrefix(a, "--compression="):
+			opts.Compression = dvol.Compression(strings.TrimPrefix(a, "--compression="))
+		case a == "--level":
+			i++
+			if i >= len(args) {
+				return opts, nil, fmt.Errorf("--level requires a value")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				return opts, nil, fmt.Errorf("invalid --level %q", args[i])
+			}
+			opts.Level = n
+		case strings.HasPrefix(a, "--level="):
+			n, err := strconv.Atoi(strings.TrimPrefix(a, "--level="))
+			if err != nil {
+				return opts, nil, fmt.Errorf("invalid --level %q", a)
+			}
+			opts.Level = n
+		default:
+			rest = append(rest, a)
+		}
+	}
+	if err := opts.Validate(); err != nil {
+		return opts, nil, err
+	}
+	return opts, rest, nil
 }
 
 func runList(store *dvol.Store) {
@@ -145,9 +194,13 @@ Commands:
   list                     list volumes
   create <volume>...       create one or more volumes
   rm <volume>...           remove volumes
-  backup <volume>...       backup volumes to backups/<name>/
+  backup [--compression gzip|xz|zstd] [--level N] <volume>...  backup volumes to backups/<name>/
   restore <volume> <b|path>  restore a volume from a backup
   backups <volume>         list backups of a volume
+
+Flags:
+  --root <dir>          backing store directory (default /var/lib/dvol)
+  --backup-dir <dir>    backups directory (default <root>/backups)
 
 `)
 }

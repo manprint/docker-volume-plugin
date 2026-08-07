@@ -36,7 +36,15 @@ func NewStore(cfg Config) (*Store, error) {
 
 func (s *Store) volumesDir() string { return filepath.Join(s.cfg.Root, volumesDir) }
 func (s *Store) metaDir() string    { return filepath.Join(s.cfg.Root, metaDir) }
-func (s *Store) backupsDir() string { return filepath.Join(s.cfg.Root, backupsDir) }
+
+// backupsDir returns the root directory holding all backups. It lives under
+// the store root by default, or wherever Config.BackupsDir points to.
+func (s *Store) backupsDir() string {
+	if s.cfg.BackupsDir != "" {
+		return s.cfg.BackupsDir
+	}
+	return filepath.Join(s.cfg.Root, backupsDir)
+}
 
 // VolumePath returns the data directory of a volume.
 func (s *Store) VolumePath(name string) string { return filepath.Join(s.volumesDir(), name) }
@@ -77,7 +85,8 @@ func (s *Store) writeMeta(name string, opts map[string]string) error {
 	return os.WriteFile(s.metaPath(name), b, 0o644)
 }
 
-// Get returns the volume and its metadata, or ErrNotFound.
+// Get returns the volume and its metadata, or ErrNotFound. The Size field is
+// not populated (computing it walks the whole volume); use Size or List.
 func (s *Store) Get(name string) (*Volume, error) {
 	b, err := os.ReadFile(s.metaPath(name))
 	if err != nil {
@@ -90,19 +99,19 @@ func (s *Store) Get(name string) (*Volume, error) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, fmt.Errorf("corrupt metadata for %q: %w", name, err)
 	}
-	return s.volumeFromMeta(m), nil
-}
-
-func (s *Store) volumeFromMeta(m meta) *Volume {
 	return &Volume{
 		Name:      m.Name,
 		CreatedAt: m.CreatedAt,
 		Options:   m.Options,
-		Size:      dirSize(s.VolumePath(m.Name)),
-	}
+	}, nil
 }
 
-// List returns all volumes sorted by name.
+// Size returns the total size in bytes of the volume data.
+func (s *Store) Size(name string) int64 {
+	return dirSize(s.VolumePath(name))
+}
+
+// List returns all volumes sorted by name, with Size populated.
 func (s *Store) List() ([]*Volume, error) {
 	entries, err := os.ReadDir(s.metaDir())
 	if err != nil {
@@ -118,6 +127,7 @@ func (s *Store) List() ([]*Volume, error) {
 		if err != nil {
 			return nil, err
 		}
+		v.Size = s.Size(name)
 		vols = append(vols, v)
 	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].Name < vols[j].Name })

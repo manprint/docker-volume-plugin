@@ -35,16 +35,14 @@ func main() {
 type driver struct {
 	store *dvol.Store
 
-	mu      sync.Mutex
-	mounts  map[string]int // volume name -> active mount count
-	mounted map[string]bool
+	mu     sync.Mutex
+	mounts map[string]int // volume name -> active mount count
 }
 
 func newDriver(store *dvol.Store) *driver {
 	return &driver{
-		store:   store,
-		mounts:  map[string]int{},
-		mounted: map[string]bool{},
+		store:  store,
+		mounts: map[string]int{},
 	}
 }
 
@@ -103,6 +101,7 @@ func (d *driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	v.Size = d.store.Size(v.Name)
 	return &volume.GetResponse{Volume: toHelper(v, d.store.VolumePath(v.Name))}, nil
 }
 

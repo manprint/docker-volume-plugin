@@ -49,11 +49,11 @@ func main() {
 		}
 	}
 
-	root, args := extractRoot(args)
+	root, backupDir, args := extractGlobalFlags(args)
 	if root == "" {
 		root = dvol.DefaultRoot
 	}
-	store, err := dvol.NewStore(dvol.Config{Root: root})
+	store, err := dvol.NewStore(dvol.Config{Root: root, BackupsDir: backupDir})
 	if err != nil {
 		fail(err)
 	}
@@ -89,10 +89,10 @@ func printMetadata() {
 	fmt.Println(`{"SchemaVersion":"0.1.0","Vendor":"fabio","Version":"` + pluginVersion + `","ShortDescription":"Backup and restore dvol volumes (also from docker compose)"}`)
 }
 
-// extractRoot pulls --root <dir> / --root=<dir> out of args.
-func extractRoot(args []string) (string, []string) {
-	root := ""
-	out := make([]string, 0, len(args))
+// extractGlobalFlags pulls --root <dir> / --root=<dir> and
+// --backup-dir <dir> / --backup-dir=<dir> out of args.
+func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
+	out = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -103,11 +103,18 @@ func extractRoot(args []string) (string, []string) {
 			}
 		case strings.HasPrefix(a, "--root="):
 			root = strings.TrimPrefix(a, "--root=")
+		case a == "--backup-dir":
+			if i+1 < len(args) {
+				backupDir = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--backup-dir="):
+			backupDir = strings.TrimPrefix(a, "--backup-dir=")
 		default:
 			out = append(out, a)
 		}
 	}
-	return root, out
+	return root, backupDir, out
 }
 
 // cmdList: docker dvol list
@@ -142,14 +149,22 @@ func (a *app) cmdBackups(args []string) {
 	tw.Flush()
 }
 
-// cmdBackup: docker dvol backup <volume>...
+// cmdBackup: docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...
 func (a *app) cmdBackup(args []string) {
-	names := expandNames(args)
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
+	level := fs.Int("level", 0, "compression level (0 = format default)")
+	fs.Parse(args)
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
+	if err := opts.Validate(); err != nil {
+		fail(err)
+	}
+	names := expandNames(fs.Args())
 	if len(names) == 0 {
-		fail("usage: docker dvol backup <volume>...")
+		fail("usage: docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...")
 	}
 	for _, n := range names {
-		path, err := a.store.Backup(n)
+		path, err := a.store.BackupWithOptions(n, opts)
 		if err != nil {
 			fail(err)
 		}
@@ -162,14 +177,21 @@ func (a *app) cmdRestore(args []string) {
 	if len(args) == 0 {
 		fail("usage: docker dvol restore <volume>... [backup]")
 	}
-	names := expandNames(args)
+	volArgs := args
+	sel := ""
+	if len(args) > 1 {
+		if last := args[len(args)-1]; !a.isVolume(last) {
+			sel = last
+			volArgs = args[:len(args)-1]
+		}
+	}
+	names := expandNames(volArgs)
 	if len(names) == 0 {
 		fail("no volumes to restore")
 	}
-	if len(names) == 1 && len(args) > 1 {
-		sel := args[1]
-		if !isBackupSelector(sel) {
-			fail("usage: docker dvol restore <volume>... [backup]")
+	if sel != "" {
+		if len(names) != 1 {
+			fail("usage: docker dvol restore <volume> <backup>")
 		}
 		path, err := a.store.ResolveBackup(names[0], sel)
 		if err != nil {
@@ -188,6 +210,12 @@ func (a *app) cmdRestore(args []string) {
 	}
 }
 
+// isVolume reports whether name is an existing volume in the store.
+func (a *app) isVolume(name string) bool {
+	_, err := a.store.Get(name)
+	return err == nil
+}
+
 func (a *app) restoreLatest(name string) error {
 	infos, err := a.store.ListBackups(name)
 	if err != nil {
@@ -204,13 +232,20 @@ func (a *app) restoreLatest(name string) error {
 	return nil
 }
 
-// cmdComposeBackup: docker dvol compose-backup [-f file] [-p project]
+// cmdComposeBackup: docker dvol compose-backup [-f file] [-p project] [--compression c] [--level n]
 func (a *app) cmdComposeBackup(args []string) {
 	fs := flag.NewFlagSet("compose-backup", flag.ContinueOnError)
 	var files multiFlag
 	project := fs.String("p", "", "project name")
+	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
+	level := fs.Int("level", 0, "compression level (0 = format default)")
 	fs.Var(&files, "f", "compose file (repeatable)")
 	fs.Parse(args)
+
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level}
+	if err := opts.Validate(); err != nil {
+		fail(err)
+	}
 
 	path, err := resolveComposeFile(files)
 	if err != nil {
@@ -224,7 +259,7 @@ func (a *app) cmdComposeBackup(args []string) {
 	if len(names) == 0 {
 		fail(fmt.Sprintf("no volumes found in %s exist in the dvol store (did you create them with `docker volume create -d dvol`?)", path))
 	}
-	out, err := a.store.BackupBundle(names, a.store.BundleDir(), cf.Project)
+	out, err := a.store.BackupBundleWithOptions(names, a.store.BundleDir(), cf.Project, opts)
 	if err != nil {
 		fail(err)
 	}
@@ -271,12 +306,13 @@ func (a *app) usage() {
 Usage:
   docker dvol list                        list volumes
   docker dvol backups <volume>            list backups of a volume
-  docker dvol backup <volume>...          backup one or more volumes
+  docker dvol backup [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
   docker dvol restore <volume>... [backup]  restore volumes (optional backup for a single volume)
-  docker dvol compose-backup [-f file.yml] [-p project]   backup all volumes of a compose project into one archive
+  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N]   backup all volumes of a compose project into one archive
   docker dvol compose-restore [-f file.yml] [-p project] [archive]  restore them
 
-Global flag: --root <dir>  backing store directory (default /var/lib/dvol)
+Global flags: --root <dir>          backing store directory (default /var/lib/dvol)
+            --backup-dir <dir>   backups directory (default <root>/backups)
 
 `)
 }
@@ -302,12 +338,6 @@ func (m *multiFlag) String() string { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error {
 	*m = append(*m, v)
 	return nil
-}
-
-// isBackupSelector is a heuristic: a restore arg is a backup selector only if
-// it is not itself a volume that exists.
-func isBackupSelector(s string) bool {
-	return strings.HasSuffix(s, ".tar.gz") || strings.ContainsAny(s, "/*?")
 }
 
 func resolveComposeFile(files []string) (string, error) {

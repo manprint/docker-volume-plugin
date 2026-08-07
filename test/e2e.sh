@@ -30,6 +30,25 @@ $D -root "$ROOT" backups app
 echo "== e2e: restore into non-existent volume (auto-create)"
 $D -root "$ROOT" restore newvol "$ROOT/backups/app/"app-*.tar.gz
 
+echo "== e2e: gzip level 9 backup + restore"
+$D -root "$ROOT" backup app --compression gzip --level 9
+rm -rf "$ROOT/volumes/app"
+$D -root "$ROOT" restore app "$ROOT"/backups/app/*.tar.gz
+[[ "$(cat "$ROOT/volumes/app/www/index.html")" == '<html>hello</html>' ]]
+
+echo "== e2e: xz roundtrip"
+$D -root "$ROOT" backup app --compression xz --level 6
+rm -rf "$ROOT/volumes/app"
+$D -root "$ROOT" restore app "$ROOT"/backups/app/*.tar.xz
+[[ "$(cat "$ROOT/volumes/app/www/index.html")" == '<html>hello</html>' ]]
+[[ "$(readlink "$ROOT/volumes/app/current")" == "www" ]]
+
+echo "== e2e: zstd roundtrip"
+$D -root "$ROOT" backup app --compression zstd
+rm -rf "$ROOT/volumes/app"
+$D -root "$ROOT" restore app "$ROOT"/backups/app/*.tar.zst
+[[ "$(cat "$ROOT/volumes/app/www/index.html")" == '<html>hello</html>' ]]
+
 echo "== e2e: docker CLI plugin metadata"
 PLUGIN=./bin/dvol-cli-plugin
 $PLUGIN docker-cli-plugin-metadata | grep -q '"SchemaVersion":"0.1.0"'
@@ -42,6 +61,15 @@ $PLUGIN dvol backup web,newvol --root "$ROOT"
 echo "== e2e: docker dvol restore"
 rm -rf "$ROOT/volumes/web"
 $PLUGIN dvol restore web --root "$ROOT"
+[[ "$(cat "$ROOT/volumes/web/www/index.html")" == '<html>cli</html>' ]]
+
+echo "== e2e: docker dvol --backup-dir custom"
+CUST="$ROOT/custom-backups"
+mkdir -p "$CUST"
+$PLUGIN dvol backup web,newvol --root "$ROOT" --backup-dir "$CUST"
+ls "$CUST"/web/*.tar.gz >/dev/null
+rm -rf "$ROOT/volumes/web"
+$PLUGIN dvol restore web --root "$ROOT" --backup-dir "$CUST"
 [[ "$(cat "$ROOT/volumes/web/www/index.html")" == '<html>cli</html>' ]]
 
 echo "== e2e: compose bundle (single archive, all volumes)"

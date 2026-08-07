@@ -76,3 +76,32 @@ func TestDefaultProjectFromDir(t *testing.T) {
 		t.Fatal("expected default project from dir")
 	}
 }
+
+func TestProjectNameNormalized(t *testing.T) {
+	p := writeTemp(t, "name: My Proj!\nvolumes:\n  data:\n")
+	cf, err := LoadComposeFile(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// docker compose lowercases and replaces invalid chars with "-"
+	if cf.Project != "my-proj-" {
+		t.Fatalf("project=%q", cf.Project)
+	}
+	if len(cf.Volumes) != 1 || cf.Volumes[0].Name != "my-proj-_data" {
+		t.Fatalf("volumes=%+v", cf.Volumes)
+	}
+}
+
+func TestProjectOverrideNormalized(t *testing.T) {
+	p := writeTemp(t, "volumes:\n  data:\n")
+	cf, err := LoadComposeFile(p, "UPPER CASE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cf.Project != "upper-case" {
+		t.Fatalf("project=%q", cf.Project)
+	}
+	if len(cf.Volumes) != 1 || cf.Volumes[0].Name != "upper-case_data" {
+		t.Fatalf("volumes=%+v", cf.Volumes)
+	}
+}

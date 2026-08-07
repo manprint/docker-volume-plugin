@@ -20,6 +20,9 @@ const (
 // Config carries the paths used by the store.
 type Config struct {
 	Root string
+	// BackupsDir is where archives are stored. Empty keeps them under
+	// <Root>/backups. Useful to push backups to a dedicated directory.
+	BackupsDir string
 }
 
 // Volume is a named volume and its metadata.
