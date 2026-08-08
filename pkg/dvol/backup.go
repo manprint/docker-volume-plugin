@@ -102,6 +102,27 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 	return path, nil
 }
 
+// BackupSourceToWriter writes a complete single-volume archive to w. It is
+// intentionally stream-only: no archive temporary file is created.
+func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w io.Writer) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	fi, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("volume source %q: %w", source, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("volume source %q is not a directory", source)
+	}
+	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
+		return addTreeTo(tw, source, "")
+	})
+}
+
 // BackupBundle backs up several volumes into a single archive stored at
 // <outDir>/<prefix>-<ts>.tar.gz. Each volume is stored under its own
 // <volume>/ prefix and a manifest.json records the contents.
@@ -192,6 +213,55 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 	return path, nil
 }
 
+// BackupBundleSourcesToWriter writes one multi-volume bundle directly to w.
+// The stream contains manifest.json and one top-level directory per volume;
+// no archive temporary file is created.
+func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]string, opts BackupOptions, w io.Writer) error {
+	if err := opts.Validate(); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("no volumes to back up")
+	}
+	clean := append([]string{}, names...)
+	sort.Strings(clean)
+	for _, name := range clean {
+		if err := checkName(name); err != nil {
+			return err
+		}
+		source, ok := sources[name]
+		if !ok {
+			return fmt.Errorf("no source for volume %q", name)
+		}
+		fi, err := os.Stat(source)
+		if err != nil {
+			return fmt.Errorf("volume source %q: %w", source, err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("volume source %q is not a directory", source)
+		}
+	}
+	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
+		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
+		mb, err := json.Marshal(mf)
+		if err != nil {
+			return err
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: "manifest.json", Mode: 0o644, Size: int64(len(mb)), Typeflag: tar.TypeReg}); err != nil {
+			return err
+		}
+		if _, err := tw.Write(mb); err != nil {
+			return err
+		}
+		for _, name := range clean {
+			if err := addTreeTo(tw, sources[name], name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // writeArchive builds an archive in a private file and publishes it only
 // after the complete stream has been closed and synced. A failed or
 // interrupted write therefore cannot expose a partial archive under its
@@ -211,36 +281,58 @@ func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) er
 		return err
 	}
 
-	w, err := opts.newWriter(f)
-	if err != nil {
+	if err := writeArchiveTo(f, opts, populate); err != nil {
 		cleanup()
 		return err
 	}
-	tw := tar.NewWriter(w)
-	if err := populate(tw); err != nil {
-		// Best-effort close only to release buffers and the file descriptor; the
-		// archive is discarded regardless of any close error at this point.
-		_ = tw.Close()
-		_ = w.Close()
+	if err := f.Sync(); err != nil {
 		cleanup()
 		return err
 	}
-	if err := closeTar(tw, w, f, tmp); err != nil {
-		return err
-	}
-	// Link publishes the completed file without replacing an existing archive.
-	// This matters for user-supplied names and second-resolution timestamps.
-	if err := os.Link(tmp, path); err != nil {
+	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
-	_ = os.Remove(tmp)
+	if opts.Overwrite {
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	} else {
+		// Link publishes the completed file without replacing an existing
+		// archive. This matters for user-supplied names and timestamp collisions.
+		if err := os.Link(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		_ = os.Remove(tmp)
+	}
 	// The rename is atomic, but syncing the parent makes the new directory
 	// entry durable across a power loss on filesystems that support fsync.
 	if err := syncDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("archive published but directory sync failed: %w", err)
 	}
 	return nil
+}
+
+// writeArchiveTo writes one complete tar/compressed stream to w. It never
+// creates an archive temporary file and is therefore suitable for stdout.
+func writeArchiveTo(w io.Writer, opts BackupOptions, populate func(*tar.Writer) error) error {
+	compressed, err := opts.newWriter(w)
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(compressed)
+	if err := populate(tw); err != nil {
+		_ = tw.Close()
+		_ = compressed.Close()
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		_ = compressed.Close()
+		return err
+	}
+	return compressed.Close()
 }
 
 // ListArchives returns the .tar.gz files in dir sorted by creation time.
@@ -281,44 +373,24 @@ func archiveFilename(defaultName string, opts BackupOptions) string {
 	base := defaultName
 	if opts.ArchiveName != "" {
 		base = opts.ArchiveName
-		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd"} {
+		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd", ".tar.lz4"} {
 			base = strings.TrimSuffix(base, suffix)
 		}
 	}
 	if opts.Timestamp {
 		timestamp := opts.TimestampValue
 		if timestamp == "" {
-			timestamp = time.Now().Format("02012006_150405")
+			now := time.Now()
+			if opts.TimestampUTC {
+				now = now.UTC()
+			}
+			timestamp = now.Format("02012006_150405")
 		}
 		base += "_" + timestamp
 	} else if opts.ArchiveName == "" {
 		base += "-" + ts()
 	}
 	return fmt.Sprintf("%s.tar.%s", base, opts.norm().ext())
-}
-
-func closeTar(tw *tar.Writer, w io.Closer, f *os.File, path string) error {
-	if err := tw.Close(); err != nil {
-		_ = w.Close()
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := w.Close(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	return nil
 }
 
 func syncDir(path string) error {
@@ -431,6 +503,23 @@ func specialModeBits(m fs.FileMode) int64 {
 	return b
 }
 
+// fileModeFromTar converts the numeric Unix mode stored by tar into Go's
+// os.FileMode representation. The permission bits share the low nine bits,
+// but setuid/setgid/sticky are represented by separate Go flags.
+func fileModeFromTar(mode int64) os.FileMode {
+	m := os.FileMode(mode & 0o777)
+	if mode&0o4000 != 0 {
+		m |= os.ModeSetuid
+	}
+	if mode&0o2000 != 0 {
+		m |= os.ModeSetgid
+	}
+	if mode&0o1000 != 0 {
+		m |= os.ModeSticky
+	}
+	return m
+}
+
 func dirHeader(name string, info os.FileInfo) *tar.Header {
 	hdr, _ := tar.FileInfoHeader(info, "")
 	hdr.Name = name
@@ -485,6 +574,44 @@ func (s *Store) RestoreSource(name, target, backupPath string) error {
 	}
 	if n == 0 {
 		return fmt.Errorf("backup archive %q contains no entries", backupPath)
+	}
+	return replaceStage(staging, target)
+}
+
+// RestoreSourceReader is the stream equivalent of RestoreSource. The input is
+// decompressed and extracted directly into staging; no archive spool file is
+// created. The live target is changed only after a complete valid stream.
+func (s *Store) RestoreSourceReader(name, target string, input io.Reader) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+		return fmt.Errorf("volume target %q is not a directory", target)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("volume target %q: %w", target, err)
+	}
+	staging, err := os.MkdirTemp(filepath.Dir(target), ".restore-stream-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	n := 0
+	tr, r, err := openArchiveReader(input)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if err := extractTarReader(tr, func(entry *tar.Header) (string, string, bool, error) {
+		n++
+		return entry.Name, staging, true, nil
+	}); err != nil {
+		return err
+	}
+	if err := finishArchiveReader(r); err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("archive stream contains no entries")
 	}
 	return replaceStage(staging, target)
 }
@@ -656,6 +783,125 @@ func (s *Store) RestoreBundleSources(path string, targets map[string]string) err
 	return nil
 }
 
+// RestoreBundleSourcesReader restores a complete bundle from one input
+// stream. It stages each volume beside its Docker mountpoint so it works even
+// when volumes are on different filesystems, while consuming the compressed
+// archive exactly once and without an archive spool file.
+func (s *Store) RestoreBundleSourcesReader(input io.Reader, targets map[string]string) error {
+	if len(targets) == 0 {
+		return fmt.Errorf("no volume targets supplied")
+	}
+	names := make([]string, 0, len(targets))
+	for name, target := range targets {
+		if err := checkName(name); err != nil {
+			return err
+		}
+		if target == "" {
+			return fmt.Errorf("empty target for volume %q", name)
+		}
+		if fi, err := os.Stat(target); err == nil && !fi.IsDir() {
+			return fmt.Errorf("volume target %q is not a directory", target)
+		} else if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("volume target %q: %w", target, err)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	type stagedVolume struct {
+		name, stage, cleanup, target string
+		metas                        []fileMeta
+		entries                      int
+	}
+	staged := make(map[string]*stagedVolume, len(names))
+	cleanup := func() {
+		for _, v := range staged {
+			_ = os.RemoveAll(v.cleanup)
+		}
+	}
+	defer cleanup()
+	for _, name := range names {
+		stage, err := os.MkdirTemp(filepath.Dir(targets[name]), "."+name+".restore-stream-*")
+		if err != nil {
+			return err
+		}
+		staged[name] = &stagedVolume{name: name, stage: filepath.Join(stage, name), cleanup: stage, target: targets[name]}
+		if err := os.MkdirAll(staged[name].stage, 0o755); err != nil {
+			return err
+		}
+	}
+
+	tr, r, err := openArchiveReader(input)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	var manifest bundleManifest
+	manifestSeen := false
+	if err := extractTarReader(tr, func(entry *tar.Header) (string, string, bool, error) {
+		if entry.Name == "manifest.json" {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return "", "", false, err
+			}
+			if err := json.Unmarshal(data, &manifest); err != nil {
+				return "", "", false, fmt.Errorf("invalid bundle manifest: %w", err)
+			}
+			manifestSeen = true
+			return "", "", false, nil
+		}
+		vol, rest, ok := splitBundlePath(entry.Name)
+		if !ok {
+			return "", "", false, fmt.Errorf("malformed bundle entry %q", entry.Name)
+		}
+		v := staged[vol]
+		if v == nil {
+			return "", "", false, fmt.Errorf("bundle contains unexpected volume %q", vol)
+		}
+		rel := vol
+		if rest != "" {
+			rel += "/" + rest
+		}
+		v.entries++
+		return rel, filepath.Dir(v.stage), true, nil
+	}); err != nil {
+		return err
+	}
+	if err := finishArchiveReader(r); err != nil {
+		return err
+	}
+	if !manifestSeen || manifest.Format != bundleFormat {
+		return fmt.Errorf("invalid or missing bundle manifest")
+	}
+	if len(manifest.Volumes) != len(names) {
+		return fmt.Errorf("bundle volume list does not match restore targets")
+	}
+	for _, name := range manifest.Volumes {
+		if staged[name] == nil {
+			return fmt.Errorf("bundle volume %q is not a restore target", name)
+		}
+	}
+	for _, name := range names {
+		v := staged[name]
+		if v.entries == 0 {
+			return fmt.Errorf("bundle contains no volume %q", name)
+		}
+		fi, err := os.Lstat(v.stage)
+		if err != nil || !fi.IsDir() {
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("refusing to restore volume %q: staged root is not a directory", name)
+		}
+	}
+	for _, name := range names {
+		if err := replaceStage(staged[name].stage, staged[name].target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // replaceStage swaps the fully-extracted staging directory into target. The
 // staging root is verified to be a real directory: an archive entry turning
 // it into a symlink refuses the swap. The previous target is kept under a
@@ -708,6 +954,34 @@ func extractTarTo(dir, path string, filter func(name string) (rel string, ok boo
 	}
 	defer f.Close()
 	defer r.Close()
+	if err := extractTarReader(tr, func(hdr *tar.Header) (string, string, bool, error) {
+		rel, ok, err := filter(hdr.Name)
+		return rel, dir, ok, err
+	}); err != nil {
+		return err
+	}
+	return finishArchiveReader(r)
+}
+
+// finishArchiveReader drains the decompressor after tar reaches its end. This
+// is required for gzip/xz/zstd/lz4 trailers and checksums to be validated; tar
+// can otherwise stop at its zero blocks before the compressor reports a
+// truncated input.
+func finishArchiveReader(r io.ReadCloser) error {
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return fmt.Errorf("finishing archive stream: %w", err)
+	}
+	if err := r.Close(); err != nil {
+		return fmt.Errorf("closing archive stream: %w", err)
+	}
+	return nil
+}
+
+// extractTarReader extracts entries from an already-open tar stream. route
+// returns a path relative to base and whether the entry should be kept. It
+// also applies metadata only after EOF, which is essential for stream restore
+// atomicity and for directory timestamps.
+func extractTarReader(tr *tar.Reader, route func(*tar.Header) (rel, base string, ok bool, err error)) error {
 	var metas []fileMeta
 	for {
 		hdr, err := tr.Next()
@@ -717,32 +991,30 @@ func extractTarTo(dir, path string, filter func(name string) (rel string, ok boo
 		if err != nil {
 			return fmt.Errorf("reading archive: %w", err)
 		}
-		rel, ok, err := filter(hdr.Name)
+		rel, base, ok, err := route(hdr)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			continue
 		}
-		target, err := safeJoin(dir, rel)
+		target, err := safeJoin(base, rel)
 		if err != nil {
 			return err
 		}
-		if err := extractEntry(hdr, tr, target, dir); err != nil {
+		if err := extractEntry(hdr, tr, target, base); err != nil {
 			return err
 		}
 		metas = append(metas, fileMeta{
 			path:   target,
 			isLink: hdr.Typeflag == tar.TypeSymlink,
-			mode:   os.FileMode(hdr.Mode),
+			mode:   fileModeFromTar(hdr.Mode),
 			uid:    hdr.Uid,
 			gid:    hdr.Gid,
 			atime:  hdr.AccessTime,
 			mtime:  hdr.ModTime,
 		})
 	}
-	// apply metadata in reverse entry order so children are handled before
-	// parents and a directory's mtime survives its own content updates.
 	for i := len(metas) - 1; i >= 0; i-- {
 		if err := metas[i].apply(); err != nil {
 			return err
@@ -764,21 +1036,22 @@ type fileMeta struct {
 }
 
 func (m fileMeta) apply() error {
-	if !m.isLink {
-		// special bits (setuid/setgid/sticky) only take effect via os.Chmod,
-		// not through OpenFile's create mode. Symlinks are skipped: on Linux
-		// symlink permission bits are ignored and os.Chmod follows the link,
-		// so chmodding a symlink would modify its target outside the volume.
-		if err := os.Chmod(m.path, m.mode); err != nil {
-			return err
-		}
-	}
 	if m.isLink {
 		if err := os.Lchown(m.path, m.uid, m.gid); err != nil {
 			return err
 		}
 	} else if err := os.Chown(m.path, m.uid, m.gid); err != nil {
 		return err
+	}
+	if !m.isLink {
+		// Apply ownership before mode: on Linux chown may clear setuid/setgid.
+		// Special bits only take effect via os.Chmod, not through OpenFile's
+		// create mode. Symlinks are skipped: on Linux symlink permission bits
+		// are ignored and os.Chmod follows the link, so chmodding a symlink
+		// would modify its target outside the volume.
+		if err := os.Chmod(m.path, m.mode); err != nil {
+			return err
+		}
 	}
 	return applyTimes(m.path, m.isLink, m.atime, m.mtime)
 }

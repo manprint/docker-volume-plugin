@@ -128,6 +128,43 @@ func TestFlatBackupRejectsArchiveCollision(t *testing.T) {
 	}
 }
 
+func TestExplicitOverwriteReplacesArchiveAtomically(t *testing.T) {
+	s, destination := newFlatStore(t)
+	if err := s.Create("web", nil); err != nil {
+		t.Fatal(err)
+	}
+	archiveName := "repeatable"
+	if err := os.WriteFile(filepath.Join(s.VolumePath("web"), "data.txt"), []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path, err := s.BackupWithOptions("web", BackupOptions{ArchiveName: archiveName, SameDestination: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.VolumePath("web"), "data.txt"), []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BackupWithOptions("web", BackupOptions{ArchiveName: archiveName, SameDestination: true}); err == nil {
+		t.Fatal("expected default collision error")
+	}
+	if _, err := s.BackupWithOptions("web", BackupOptions{ArchiveName: archiveName, SameDestination: true, Overwrite: true}); err != nil {
+		t.Fatalf("explicit overwrite: %v", err)
+	}
+	if err := s.Remove("web"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Restore("web", path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(s.VolumePath("web"), "data.txt"))
+	if err != nil || string(got) != "second" {
+		t.Fatalf("overwritten archive data: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, archiveName+".tar.gz")); err != nil {
+		t.Fatalf("overwritten archive missing: %v", err)
+	}
+}
+
 func TestFlatBackupIndexRecoversPendingPublishedArchive(t *testing.T) {
 	s, destination := newFlatStore(t)
 	archive := "web-backup.tar.gz"

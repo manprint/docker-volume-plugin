@@ -242,13 +242,25 @@ func (s *Store) writeFlatIndex(idx flatBackupIndex) error {
 // live pending reservation for a stale crash entry.
 func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, populate func(*tar.Writer) error) error {
 	return s.withFlatIndexLock(func(idx *flatBackupIndex) error {
+		previous := append([]flatBackupIndexEntry(nil), idx.Entries...)
+		if opts.Overwrite {
+			filtered := idx.Entries[:0]
+			for _, entry := range idx.Entries {
+				if entry.Name != name {
+					filtered = append(filtered, entry)
+				}
+			}
+			idx.Entries = filtered
+		}
 		for _, entry := range idx.Entries {
 			if entry.Name == name {
 				return fmt.Errorf("backup archive %q already exists", name)
 			}
 		}
 		if _, err := os.Lstat(path); err == nil {
-			return fmt.Errorf("backup archive %q already exists", name)
+			if !opts.Overwrite {
+				return fmt.Errorf("backup archive %q already exists", name)
+			}
 		} else if !os.IsNotExist(err) {
 			return err
 		}
@@ -259,11 +271,11 @@ func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, p
 			Pending:   true,
 		})
 		if err := s.writeFlatIndex(*idx); err != nil {
-			idx.Entries = idx.Entries[:len(idx.Entries)-1]
+			idx.Entries = previous
 			return err
 		}
 		if err := writeArchive(path, opts, populate); err != nil {
-			idx.Entries = idx.Entries[:len(idx.Entries)-1]
+			idx.Entries = previous
 			_ = s.writeFlatIndex(*idx)
 			return err
 		}

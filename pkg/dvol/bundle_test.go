@@ -1,6 +1,7 @@
 package dvol
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -112,6 +113,56 @@ func TestExternalBundleSourcesRoundTrip(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(targets[name], "old.txt")); !os.IsNotExist(err) {
 			t.Fatalf("%s old target data should have been replaced", name)
+		}
+	}
+}
+
+func TestExternalBundleStreamRoundTripAndTruncation(t *testing.T) {
+	s := newTestStore(t)
+	sources := map[string]string{}
+	for _, name := range []string{"stream_app", "stream_db"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "data.txt"), []byte("stream-"+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sources[name] = dir
+	}
+	var stream bytes.Buffer
+	if err := s.BackupBundleSourcesToWriter([]string{"stream_db", "stream_app"}, sources, BackupOptions{Compression: CompressionZstd, Threads: 1}, &stream); err != nil {
+		t.Fatalf("BackupBundleSourcesToWriter: %v", err)
+	}
+	targets := map[string]string{}
+	for _, name := range []string{"stream_app", "stream_db"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		targets[name] = dir
+	}
+	if err := s.RestoreBundleSourcesReader(bytes.NewReader(stream.Bytes()), targets); err != nil {
+		t.Fatalf("RestoreBundleSourcesReader: %v", err)
+	}
+	for name, target := range targets {
+		got, err := os.ReadFile(filepath.Join(target, "data.txt"))
+		if err != nil || string(got) != "stream-"+name {
+			t.Fatalf("%s data: %q err=%v", name, got, err)
+		}
+		if _, err := os.Stat(filepath.Join(target, "keep.txt")); !os.IsNotExist(err) {
+			t.Fatalf("%s old data survived stream restore", name)
+		}
+	}
+
+	for name, target := range targets {
+		if err := os.WriteFile(filepath.Join(target, "keep.txt"), []byte("still-keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		data := stream.Bytes()
+		if err := s.RestoreBundleSourcesReader(bytes.NewReader(data[:len(data)-5]), map[string]string{name: target}); err == nil {
+			t.Fatal("expected truncated bundle to fail")
+		}
+		got, err := os.ReadFile(filepath.Join(target, "keep.txt"))
+		if err != nil || string(got) != "still-keep" {
+			t.Fatalf("%s changed after truncated bundle: %q err=%v", name, got, err)
 		}
 	}
 }

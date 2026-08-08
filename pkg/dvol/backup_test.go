@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,63 @@ func TestExternalSourceBackupAndRestore(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "old.txt")); !os.IsNotExist(err) {
 		t.Fatalf("old target data should have been replaced")
+	}
+}
+
+func TestExternalSourceStreamRoundTripAllCompressions(t *testing.T) {
+	s := newTestStore(t)
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "stream.txt"), []byte("stream-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, compression := range []Compression{CompressionGzip, CompressionXz, CompressionZstd, CompressionLz4} {
+		t.Run(string(compression), func(t *testing.T) {
+			var stream bytes.Buffer
+			if err := s.BackupSourceToWriter("stream-"+string(compression), source, BackupOptions{Compression: compression, Threads: 1}, &stream); err != nil {
+				t.Fatalf("BackupSourceToWriter: %v", err)
+			}
+			target := t.TempDir()
+			if err := os.WriteFile(filepath.Join(target, "old.txt"), []byte("remove"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RestoreSourceReader("stream-"+string(compression), target, bytes.NewReader(stream.Bytes())); err != nil {
+				t.Fatalf("RestoreSourceReader: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(target, "stream.txt"))
+			if err != nil || string(got) != "stream-data" {
+				t.Fatalf("stream data: %q err=%v", got, err)
+			}
+			if _, err := os.Stat(filepath.Join(target, "old.txt")); !os.IsNotExist(err) {
+				t.Fatal("old target data survived stream restore")
+			}
+		})
+	}
+}
+
+func TestExternalSourceStreamTruncationPreservesTarget(t *testing.T) {
+	s := newTestStore(t)
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stream bytes.Buffer
+	if err := s.BackupSourceToWriter("stream", source, BackupOptions{Compression: CompressionZstd, Threads: 1}, &stream); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data := stream.Bytes()
+	if len(data) < 16 {
+		t.Fatal("test archive unexpectedly small")
+	}
+	if err := s.RestoreSourceReader("stream", target, bytes.NewReader(data[:len(data)/2])); err == nil {
+		t.Fatal("expected truncated stream to fail")
+	}
+	got, err := os.ReadFile(filepath.Join(target, "keep.txt"))
+	if err != nil || string(got) != "keep" {
+		t.Fatalf("target changed after truncated stream: %q err=%v", got, err)
 	}
 }
 
@@ -446,12 +504,35 @@ func TestBackupPreservesSpecialModeBits(t *testing.T) {
 	if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(p, 0o4755); err != nil { // setuid + rwxr-xr-x
+	if err := os.Chmod(p, os.ModeSetuid|0o755); err != nil { // setuid + rwxr-xr-x
 		t.Fatal(err)
 	}
 	path, err := s.Backup("svc")
 	if err != nil {
 		t.Fatal(err)
+	}
+	tr, zr, f, err := openArchive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	defer f.Close()
+	var foundMode int64
+	for {
+		hdr, nextErr := tr.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			t.Fatal(nextErr)
+		}
+		if strings.TrimSuffix(hdr.Name, "/") == "runme" {
+			foundMode = hdr.Mode
+			break
+		}
+	}
+	if foundMode&0o4000 == 0 {
+		t.Fatalf("setuid bit missing from archive header: %#o", foundMode)
 	}
 	if err := s.Remove("svc"); err != nil {
 		t.Fatal(err)

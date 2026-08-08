@@ -2,6 +2,7 @@ package dvol
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -49,6 +50,12 @@ type BackupOptions struct {
 	// SameDestination stores a single-volume archive directly in the backup
 	// destination instead of creating a directory named after the volume.
 	SameDestination bool
+	// Overwrite permits replacing an existing archive atomically. The default
+	// is collision-safe: an existing archive causes an error.
+	Overwrite bool
+	// TimestampUTC selects UTC for generated timestamp names. The default is
+	// the local timezone for backward compatibility.
+	TimestampUTC bool
 }
 
 func (o BackupOptions) norm() BackupOptions {
@@ -267,6 +274,43 @@ func openArchive(path string) (*tar.Reader, io.ReadCloser, *os.File, error) {
 		return nil, nil, nil, err
 	}
 	return tar.NewReader(r), r, f, nil
+}
+
+// openArchiveReader detects a supported compression stream from its magic
+// bytes. Unlike openArchive it does not require a path or a temporary file and
+// is used by restore --stdin.
+func openArchiveReader(input io.Reader) (*tar.Reader, io.ReadCloser, error) {
+	br := bufio.NewReader(input)
+	header, err := br.Peek(6)
+	if err != nil && len(header) < 4 {
+		return nil, nil, fmt.Errorf("reading archive stream header: %w", err)
+	}
+	var r io.ReadCloser
+	switch {
+	case len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b:
+		g, e := gzip.NewReader(br)
+		if e != nil {
+			return nil, nil, e
+		}
+		r = g
+	case len(header) >= 6 && string(header[:6]) == "\xfd7zXZ\x00":
+		x, e := xz.NewReader(br)
+		if e != nil {
+			return nil, nil, e
+		}
+		r = io.NopCloser(x)
+	case len(header) >= 4 && header[0] == 0x28 && header[1] == 0xb5 && header[2] == 0x2f && header[3] == 0xfd:
+		z, e := zstd.NewReader(br)
+		if e != nil {
+			return nil, nil, e
+		}
+		r = readCloser{Reader: z, close: func() error { z.Close(); return nil }}
+	case len(header) >= 4 && header[0] == 0x04 && header[1] == 0x22 && header[2] == 0x4d && header[3] == 0x18:
+		r = readCloser{Reader: lz4.NewReader(br), close: func() error { return nil }}
+	default:
+		return nil, nil, fmt.Errorf("unsupported archive stream (expected gzip, xz, zstd or lz4)")
+	}
+	return tar.NewReader(r), r, nil
 }
 
 // readCloser couples a Reader with a Close func, adapting types whose Close

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,9 +30,10 @@ const (
 )
 
 type app struct {
-	store  *dvol.Store
-	docker dockerVolumeClient
-	out    *tabwriter.Writer
+	store          *dvol.Store
+	docker         dockerVolumeClient
+	out            *tabwriter.Writer
+	destinationSet bool
 }
 
 func main() {
@@ -52,6 +54,7 @@ func main() {
 		}
 	}
 
+	destinationSet := hasGlobalDestination(args)
 	root, backupDir, args := extractGlobalFlags(args)
 	if root == "" {
 		root = defaultBackupRoot()
@@ -61,7 +64,7 @@ func main() {
 		fail(err)
 	}
 
-	a := &app{store: store, docker: newDockerCLI()}
+	a := &app{store: store, docker: newDockerCLI(), destinationSet: destinationSet}
 	if len(args) == 0 {
 		a.usage()
 		return
@@ -133,6 +136,16 @@ func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
 	return root, backupDir, out
 }
 
+func hasGlobalDestination(args []string) bool {
+	for _, arg := range args {
+		if arg == "--destination" || arg == "--backup-dir" ||
+			strings.HasPrefix(arg, "--destination=") || strings.HasPrefix(arg, "--backup-dir=") {
+			return true
+		}
+	}
+	return false
+}
+
 // volumeSource resolves a Docker volume to the mountpoint reported by Docker
 // Engine. The backup store contains archives only; volume data always remains
 // in Docker's volume.
@@ -162,6 +175,24 @@ func (a *app) restoreVolume(name, archive string) error {
 		return err
 	}
 	return a.store.RestoreSource(name, source, archive)
+}
+
+func (a *app) volumeTargets(names []string) (map[string]string, error) {
+	targets := make(map[string]string, len(names))
+	for _, name := range names {
+		source, err := a.volumeSource(name)
+		if errors.Is(err, errDockerVolumeNotFound) {
+			info, createErr := a.docker.Create(name)
+			if createErr != nil {
+				return nil, fmt.Errorf("create Docker volume %q: %w", name, createErr)
+			}
+			source = info.Mountpoint
+		} else if err != nil {
+			return nil, err
+		}
+		targets[name] = source
+	}
+	return targets, nil
 }
 
 func (a *app) isVolume(name string) bool {
@@ -212,23 +243,57 @@ func (a *app) cmdBackup(args []string) {
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd or lz4")
 	level := fs.Int("level", 0, "compression level (0 = balanced default)")
 	threads := fs.Int("threads", 0, "compression threads (0 = half of CPU count; xz uses one)")
+	stdout := fs.Bool("stdout", false, "write the archive stream to stdout")
+	bundle := fs.Bool("bundle", false, "write multiple volumes as one bundle")
+	overwrite := fs.Bool("overwrite", false, "replace an existing local archive")
 	var archiveNames multiFlag
 	fs.Var(&archiveNames, "archive-name", "archive name stem or volume::archive-name (repeatable)")
 	fs.Var(&archiveNames, "name", "alias for --archive-name")
 	includeTimestamp := false
 	fs.BoolVar(&includeTimestamp, "timestamp", false, "append _ddmmyyyy_HHMMSS to the archive name")
+	timestampUTC := false
+	fs.BoolVar(&timestampUTC, "timestamp-utc", false, "use UTC instead of local time for --timestamp")
 	sameDestination := false
 	fs.BoolVar(&sameDestination, "same-destination", false, "store all archives directly in the destination directory")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, Timestamp: includeTimestamp, SameDestination: sameDestination}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, Timestamp: includeTimestamp, TimestampUTC: timestampUTC, SameDestination: sameDestination, Overwrite: *overwrite}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
 	names := expandNames(fs.Args())
 	if len(names) == 0 {
-		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd|lz4] [--level N] [--threads N] <volume>...")
+		fail("usage: docker dvol backup [options] <volume>...")
+	}
+	if *stdout {
+		if a.destinationSet {
+			fail("--stdout cannot be combined with --destination or --backup-dir")
+		}
+		if len(archiveNames) > 0 || includeTimestamp || timestampUTC || sameDestination || *overwrite {
+			fail("--stdout cannot be combined with archive naming, timestamp, --same-destination or --overwrite")
+		}
+		if len(names) > 1 && !*bundle {
+			fail("multiple volumes require --bundle when using --stdout")
+		}
+		sources := make(map[string]string, len(names))
+		for _, n := range names {
+			source, err := a.volumeSource(n)
+			if err != nil {
+				fail(err)
+			}
+			sources[n] = source
+		}
+		var err error
+		if *bundle {
+			err = a.store.BackupBundleSourcesToWriter(names, sources, opts, os.Stdout)
+		} else {
+			err = a.store.BackupSourceToWriter(names[0], sources[names[0]], opts, os.Stdout)
+		}
+		if err != nil {
+			fail(err)
+		}
+		return
 	}
 	archiveMap, err := parseArchiveNames(archiveNames, names)
 	if err != nil {
@@ -236,7 +301,34 @@ func (a *app) cmdBackup(args []string) {
 	}
 	timestampValue := ""
 	if includeTimestamp {
-		timestampValue = time.Now().Format("02012006_150405")
+		now := time.Now()
+		if timestampUTC {
+			now = now.UTC()
+		}
+		timestampValue = now.Format("02012006_150405")
+	}
+	if *bundle {
+		if len(archiveNames) > 1 || (len(archiveNames) == 1 && strings.Contains(archiveNames[0], "::")) {
+			fail("--archive-name with --bundle accepts one bundle name, not volume::name mappings")
+		}
+		if len(archiveNames) == 1 {
+			opts.ArchiveName = archiveNames[0]
+		}
+		opts.TimestampValue = timestampValue
+		sources := make(map[string]string, len(names))
+		for _, n := range names {
+			source, err := a.volumeSource(n)
+			if err != nil {
+				fail(err)
+			}
+			sources[n] = source
+		}
+		path, err := a.store.BackupBundleSourcesWithOptions(names, sources, a.store.BundleDir(), "volumes", opts)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Printf("backed up %d volume(s) (%s) -> %s\n", len(names), strings.Join(names, ", "), path)
+		return
 	}
 	for _, n := range names {
 		source, err := a.volumeSource(n)
@@ -254,10 +346,81 @@ func (a *app) cmdBackup(args []string) {
 	}
 }
 
-// cmdRestore: docker dvol restore <volume>... [backup]
+// cmdRestore: docker dvol restore [--stdin] [--spool] [--bundle] <volume>... [backup]
 func (a *app) cmdRestore(args []string) {
-	if len(args) == 0 {
-		fail("usage: docker dvol restore <volume>... [backup]")
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	stdin := fs.Bool("stdin", false, "read the archive stream from stdin")
+	spool := fs.Bool("spool", false, "with --stdin, spool the archive to a temporary file before restoring")
+	bundle := fs.Bool("bundle", false, "restore a complete multi-volume bundle")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	args = fs.Args()
+	if len(args) == 0 && !*bundle {
+		fail("usage: docker dvol restore [--stdin] [--spool] [--bundle] <volume>... [backup]")
+	}
+	if *stdin {
+		if len(args) == 0 {
+			fail("--stdin requires the target volume names")
+		}
+		if !*bundle && len(args) != 1 {
+			fail("multiple stdin volumes require --bundle")
+		}
+		if *bundle && len(args) < 1 {
+			fail("--bundle --stdin requires all target volume names")
+		}
+		targets, err := a.volumeTargets(expandNames(args))
+		if err != nil {
+			fail(err)
+		}
+		var input io.Reader = os.Stdin
+		var cleanup func()
+		if *spool {
+			f, err := os.CreateTemp("", ".dvol-stdin-*.archive")
+			if err != nil {
+				fail(err)
+			}
+			cleanup = func() { _ = f.Close(); _ = os.Remove(f.Name()) }
+			defer cleanup()
+			if _, err := io.Copy(f, os.Stdin); err != nil {
+				fail(fmt.Errorf("spooling stdin: %w", err))
+			}
+			if _, err := f.Seek(0, 0); err != nil {
+				fail(err)
+			}
+			input = f
+		}
+		if *bundle {
+			err = a.store.RestoreBundleSourcesReader(input, targets)
+		} else {
+			names := expandNames(args)
+			name := names[0]
+			err = a.store.RestoreSourceReader(name, targets[name], input)
+		}
+		if err != nil {
+			fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "restored %d volume(s) from stdin\n", len(targets))
+		return
+	}
+	if *spool {
+		fail("--spool requires --stdin")
+	}
+	if *bundle {
+		if len(args) < 2 {
+			fail("usage: docker dvol restore --bundle <volume>... <archive>")
+		}
+		archive := args[len(args)-1]
+		names := expandNames(args[:len(args)-1])
+		targets, err := a.volumeTargets(names)
+		if err != nil {
+			fail(err)
+		}
+		if err := a.store.RestoreBundleSources(archive, targets); err != nil {
+			fail(err)
+		}
+		fmt.Fprintf(os.Stderr, "restored %d volume(s) from %s\n", len(names), archive)
+		return
 	}
 	volArgs := args
 	sel := ""
@@ -316,17 +479,20 @@ func (a *app) cmdComposeBackup(args []string) {
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd or lz4")
 	level := fs.Int("level", 0, "compression level (0 = balanced default)")
 	threads := fs.Int("threads", 0, "compression threads (0 = half of CPU count; xz uses one)")
+	stdout := fs.Bool("stdout", false, "write the bundle stream to stdout")
 	archiveName := ""
 	fs.StringVar(&archiveName, "archive-name", "", "archive name stem (suffix is added automatically)")
 	fs.StringVar(&archiveName, "name", "", "alias for --archive-name")
 	includeTimestamp := false
 	fs.BoolVar(&includeTimestamp, "timestamp", false, "append _ddmmyyyy_HHMMSS to the archive name")
+	timestampUTC := false
+	fs.BoolVar(&timestampUTC, "timestamp-utc", false, "use UTC instead of local time for --timestamp")
 	fs.Var(&files, "f", "compose file (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
 
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, ArchiveName: archiveName, Timestamp: includeTimestamp}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, ArchiveName: archiveName, Timestamp: includeTimestamp, TimestampUTC: timestampUTC}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
@@ -346,6 +512,18 @@ func (a *app) cmdComposeBackup(args []string) {
 	if len(names) == 0 {
 		fail(fmt.Sprintf("no volumes from %s exist in Docker", path))
 	}
+	if *stdout {
+		if a.destinationSet {
+			fail("--stdout cannot be combined with --destination or --backup-dir")
+		}
+		if archiveName != "" || includeTimestamp || timestampUTC {
+			fail("--stdout cannot be combined with archive naming or timestamp")
+		}
+		if err := a.store.BackupBundleSourcesToWriter(names, sources, opts, os.Stdout); err != nil {
+			fail(err)
+		}
+		return
+	}
 	out, err := a.store.BackupBundleSourcesWithOptions(names, sources, a.store.BundleDir(), cf.Project, opts)
 	if err != nil {
 		fail(err)
@@ -358,11 +536,19 @@ func (a *app) cmdComposeRestore(args []string) {
 	fs := flag.NewFlagSet("compose-restore", flag.ContinueOnError)
 	var files multiFlag
 	project := fs.String("p", "", "project name")
+	stdin := fs.Bool("stdin", false, "read the bundle stream from stdin")
+	spool := fs.Bool("spool", false, "with --stdin, spool the bundle before restoring")
 	fs.Var(&files, "f", "compose file (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
 	rest := fs.Args()
+	if *spool && !*stdin {
+		fail("--spool requires --stdin")
+	}
+	if *stdin && len(rest) > 0 {
+		fail("--stdin cannot be combined with an archive path")
+	}
 
 	path, err := resolveComposeFile(files)
 	if err != nil {
@@ -375,29 +561,44 @@ func (a *app) cmdComposeRestore(args []string) {
 	names := composeVolumeNames(cf)
 
 	archive := ""
-	if len(rest) > 0 {
-		archive = rest[0]
-	} else {
-		archive, err = latestBundle(a.store.BundleDir(), cf.Project)
-		if err != nil {
-			fail(err)
+	if !*stdin {
+		if len(rest) > 0 {
+			archive = rest[0]
+		} else {
+			archive, err = latestBundle(a.store.BundleDir(), cf.Project)
+			if err != nil {
+				fail(err)
+			}
 		}
 	}
-	targets := make(map[string]string, len(names))
-	for _, name := range names {
-		source, err := a.volumeSource(name)
-		if errors.Is(err, errDockerVolumeNotFound) {
-			info, createErr := a.docker.Create(name)
-			if createErr != nil {
-				fail(fmt.Errorf("create Docker volume %q: %w", name, createErr))
+	targets, err := a.volumeTargets(names)
+	if err != nil {
+		fail(err)
+	}
+	var input io.Reader
+	var cleanup func()
+	if *stdin {
+		input = os.Stdin
+		if *spool {
+			f, err := os.CreateTemp("", ".dvol-compose-stdin-*.archive")
+			if err != nil {
+				fail(err)
 			}
-			source = info.Mountpoint
-			err = nil
+			cleanup = func() { _ = f.Close(); _ = os.Remove(f.Name()) }
+			defer cleanup()
+			if _, err := io.Copy(f, os.Stdin); err != nil {
+				fail(fmt.Errorf("spooling stdin: %w", err))
+			}
+			if _, err := f.Seek(0, 0); err != nil {
+				fail(err)
+			}
+			input = f
 		}
-		if err != nil {
+		if err := a.store.RestoreBundleSourcesReader(input, targets); err != nil {
 			fail(err)
 		}
-		targets[name] = source
+		fmt.Fprintf(os.Stderr, "restored %d volume(s) from stdin\n", len(names))
+		return
 	}
 	if err := a.store.RestoreBundleSources(archive, targets); err != nil {
 		fail(err)
@@ -411,10 +612,10 @@ func (a *app) usage() {
 Usage:
   docker dvol list                        list volumes
   docker dvol backups <volume>            list backups of a volume
-	  docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd|lz4] [--level N] [--threads N] <volume>...  backup one or more volumes
-  docker dvol restore <volume>... [backup]  restore volumes (optional backup for a single volume)
-	  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N] [--threads N]   backup all volumes of a compose project into one archive
-  docker dvol compose-restore [-f file.yml] [-p project] [archive]  restore them
+	docker dvol backup [options] <volume>...  backup one or more volumes
+  docker dvol restore [--stdin] [--spool] [--bundle] <volume>... [backup]
+	docker dvol compose-backup [-f file.yml] [-p project] [--stdout] [options]
+  docker dvol compose-restore [-f file.yml] [-p project] [--stdin] [--spool] [archive]
 
 Global flags: --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)
             --destination <dir>  backup destination (default <root>/backups; --backup-dir is an alias)

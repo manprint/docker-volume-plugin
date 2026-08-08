@@ -2,7 +2,7 @@ GO          ?= go
 CLI_PLUGIN  = docker-dvol
 BIN         = bin/dvol-cli-plugin bin/$(CLI_PLUGIN)
 
-.PHONY: all build test lint e2e acceptance acceptance-mongo cli-plugin-build cli-plugin-install clean
+.PHONY: all build test lint e2e acceptance acceptance-mongo acceptance-stream cli-plugin-build cli-plugin-install clean
 
 all: build
 
@@ -32,6 +32,7 @@ acceptance:
 	./test/acceptance_mongo_e2e.sh
 	DVOL_MODE=docker ./test/acceptance_e2e.sh
 	DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
+	./test/acceptance_stream_e2e.sh
 
 ## acceptance-mongo: run the MongoDB matrix through both client paths
 acceptance-mongo:
@@ -42,6 +43,10 @@ acceptance-mongo:
 	@chmod +x "$(HOME)/.docker/cli-plugins/docker-dvol"
 	./test/acceptance_mongo_e2e.sh
 	DVOL_MODE=docker ./test/acceptance_mongo_e2e.sh
+
+## acceptance-stream: test stdin/stdout through docker dvol and a Docker rclone remote
+acceptance-stream: build cli-plugin-install
+	./test/acceptance_stream_e2e.sh
 
 ## lint: go vet
 lint:

@@ -153,6 +153,13 @@ Opzioni di `backup`:
 --same-destination            salva gli archivi direttamente in <destination>;
                               default: false, mantiene <destination>/<volume>/
 --timestamp                   aggiunge _ddmmyyyy_HHMMSS; default: false
+--timestamp-utc               usa UTC per --timestamp; default: timezone locale
+--overwrite                   sostituisce un archivio locale esistente;
+                              default: false, collisioni rifiutate
+--bundle                      produce un unico bundle multi-volume;
+                              necessario con più volumi in modalità --stdout
+--stdout                     scrive soltanto l’archivio binario su stdout;
+                              diagnostica su stderr; default: false
 ```
 
 Le stesse opzioni `--compression`, `--level` e `--threads` sono disponibili
@@ -209,9 +216,76 @@ Senza `--same-destination` gli stessi archivi vengono invece scritti in:
 /home/ubuntu/stack_odoo/filestore_data/filestore-odoo_07082026_223010.tar.zst
 ```
 
+### Backup in streaming verso rclone
+
+`--stdout` non crea il file archivio e non usa un file temporaneo per conservarne
+lo stream. È pensato anche per volumi più grandi dello spazio libero locale:
+
+```bash
+docker dvol backup --stdout --compression zstd mongo_data \
+  | rclone rcat myremote:/dumps/mongo/backup-mongo-dev.tar.zst
+```
+
+`rclone rcat` richiede sempre il percorso completo dell’oggetto remoto. Non
+passare soltanto una directory e non aspettarsi che il nome venga generato da
+dvol. Se l’oggetto esiste, rclone lo sovrascrive secondo la propria semantica;
+per evitare collisioni usare un nome univoco o una directory `.partial` gestita
+dallo script chiamante.
+
+In modalità stream `--archive-name`, `--timestamp`, `--timestamp-utc`,
+`--same-destination`, `--overwrite` e `--destination` vengono rifiutati: il
+nome remoto e il timestamp del file sono responsabilità del comando che
+consuma stdout. Esempio:
+
+```bash
+stamp="$(date -u +%d%m%Y_%H%M%S)"
+set -o pipefail
+docker dvol backup --stdout --compression zstd mongo_data \
+  | rclone rcat "myremote:/dumps/mongo/mongodb-vol_$stamp.tar.zst"
+```
+
+Tutti i messaggi di stato ed errore sono su stderr, quindi stdout può essere
+passato senza contaminazioni a rclone, SSH, cifratura o altro programma.
+
+Per più volumi usare esplicitamente `--bundle`: viene prodotto un solo stream
+con `manifest.json` e una directory per volume. Non concatenare archivi singoli.
+
+```bash
+docker dvol backup --stdout --bundle --compression zstd \
+  pg_data filestore_data \
+  | rclone rcat myremote:/dumps/odoo/odoo-volumes.tar.zst
+```
+
+Con più volumi, omettere `--bundle` è un errore. Il bundle viene ripristinato
+completo; non è previsto il restore selettivo nella modalità stdin.
+
+`--stdout` non gestisce retry, retention, lista dei backup o atomicità del
+backend remoto. Per trasferimenti critici, lo script può caricare un nome
+temporaneo e promuoverlo dopo la verifica:
+
+```bash
+set -euo pipefail
+id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+tmp="myremote:/dumps/mongo/.partial/mongo_$id.tar.zst"
+final="myremote:/dumps/mongo/mongo_$id.tar.zst"
+docker dvol backup --stdout --compression zstd mongo_data \
+  | rclone rcat "$tmp"
+rclone size "$tmp"
+rclone moveto "$tmp" "$final"
+```
+
+Questa promozione dipende dal backend: `moveto` può essere rename oppure copia
+più cancellazione. La modalità stream evita il file temporaneo locale del
+backup, ma non può garantire da sola la durabilità remota.
+
 Il timestamp viene calcolato una sola volta per l’intero comando. Con
 `--same-destination` i nomi archivio devono essere univoci; un archivio già
 esistente causa errore e non viene sovrascritto.
+
+Il timestamp predefinito usa la timezone locale per compatibilità. Con
+`--timestamp-utc` viene usato UTC. `--overwrite` abilita esplicitamente la
+sostituzione atomica di un archivio locale esistente; senza il flag il default
+è sicuro e ripetere lo stesso comando fallisce senza alterare il backup valido.
 
 La modalità flat mantiene la trasparenza dei comandi esistenti tramite il file
 di metadati persistente `.dvol-index.json`, aggiornato atomicamente. Perciò
@@ -250,6 +324,44 @@ Il restore estrae prima in uno staging sullo stesso filesystem, valida
 l’archivio e poi sostituisce il contenuto con uno swap atomico. Un archivio
 invalido lascia intatto il volume esistente.
 
+### Restore da stdin
+
+Un archivio remoto può essere letto con `rclone cat`:
+
+```bash
+rclone cat myremote:/dumps/mongo/backup-mongo-dev.tar.zst \
+  | docker dvol restore --stdin mongo_data
+```
+
+Il default `--stdin` non conserva l’archivio compresso su disco: lo legge in
+stream, lo decomprime e lo estrae in una directory di staging privata. Il
+volume live viene sostituito soltanto dopo EOF, validazione tar/compressione e
+metadata. Lo staging dei dati ripristinati è necessario per mantenere
+l’atomicità; non è una copia temporanea dell’archivio.
+
+È disponibile anche la modalità esplicita con spool:
+
+```bash
+rclone cat myremote:/dumps/mongo/backup-mongo-dev.tar.zst \
+  | docker dvol restore --stdin --spool mongo_data
+```
+
+`--spool` conserva prima tutto lo stream in un file temporaneo locale e poi
+esegue il restore. Usa più spazio, ma permette di rileggere l’input e isolare
+ulteriormente il trasporto dal restore. Il file viene rimosso anche in caso di
+errore.
+
+Per un bundle diretto:
+
+```bash
+rclone cat myremote:/dumps/odoo/odoo-volumes.tar.zst \
+  | docker dvol restore --stdin --bundle pg_data filestore_data
+```
+
+Il bundle viene ripristinato interamente: i nomi indicati devono corrispondere
+a tutti i volumi dichiarati nel manifest. Un input troncato o corrotto lascia
+invariati tutti i volumi target.
+
 ## Docker Compose
 
 Dato un normale `compose.yaml`:
@@ -280,8 +392,8 @@ docker dvol compose-backup -f compose.yaml
 Comandi:
 
 ```text
-compose-backup [-f <file>] [-p <project>] [--compression <formato>] [--level <n>]
-compose-restore [-f <file>] [-p <project>] [<archivio>]
+compose-backup [-f <file>] [-p <project>] [--stdout] [--compression <formato>] [--level <n>] [--threads <n>]
+compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [<archivio>]
 ```
 
 Il bundle viene scritto in `backups/compose/`, contiene `manifest.json` e una
@@ -296,6 +408,34 @@ docker dvol compose-restore -f compose.yaml \
 
 Tutti gli staging vengono preparati prima degli swap; ogni volume viene
 sostituito atomicamente e indipendentemente dagli altri.
+
+`compose-backup --stdout` produce sempre un bundle unico, adatto a rclone:
+
+```bash
+docker compose down
+docker dvol compose-backup --stdout -f compose.yaml -p demo \
+  --compression zstd \
+  | rclone rcat myremote:/dumps/demo/demo-volumes.tar.zst
+```
+
+Restore Compose da remoto, senza spool dell’archivio:
+
+```bash
+rclone cat myremote:/dumps/demo/demo-volumes.tar.zst \
+  | docker dvol compose-restore --stdin -f compose.yaml -p demo
+```
+
+Per usare la seconda modalità di restore:
+
+```bash
+rclone cat myremote:/dumps/demo/demo-volumes.tar.zst \
+  | docker dvol compose-restore --stdin --spool -f compose.yaml -p demo
+```
+
+`compose-restore` richiede il Compose file per determinare i target e il
+progetto per risolvere i nomi. Il manifest deve corrispondere esattamente ai
+volumi del progetto; un mismatch causa errore prima degli swap. Il restore è
+completo, non selettivo. Fermare o quiescere i servizi prima del restore.
 
 ## Consistenza e interruzioni
 
@@ -316,6 +456,18 @@ In caso di crash durante il backup:
 - il volume sorgente non viene modificato;
 - un archivio temporaneo incompleto non viene pubblicato;
 - gli archivi già pubblicati restano validi.
+
+In modalità `--stdout` non viene creato il file temporaneo dell’archivio: se il
+consumer remoto interrompe la pipe, dvol segnala l’errore e non può controllare
+se il backend abbia lasciato un oggetto parziale. Per questo il percorso remoto
+deve essere verificato dal chiamante; `rclone rcat` non può ritentare da capo
+una pipe già consumata.
+
+In caso di errore durante `--stdin`, la decompressione e il trailer vengono
+consumati e verificati prima del commit. Nella modalità senza spool non viene
+conservato l’archivio compresso, ma viene comunque usato lo staging dei dati
+necessario allo swap atomico. Un bundle viene pubblicato solo dopo la
+validazione completa di tutti i volumi.
 
 In caso di crash durante il restore, staging e rollback usano percorsi privati
 collision-free; le sostituzioni interrotte vengono recuperate all’avvio
@@ -341,6 +493,7 @@ make lint
 make e2e
 sudo make acceptance
 sudo make acceptance-mongo
+make acceptance-stream
 make clean
 ```
 
@@ -357,6 +510,16 @@ Prima dell’esecuzione copia il binario CLI in
 Docker Engine operativo, permessi sui mountpoint dei volumi e può scaricare le
 immagini di test. Lo script rimuove al termine container, volumi, reti Compose,
 repository temporaneo e le immagini scaricate esclusivamente dalla suite.
+
+`make acceptance-stream` esegue la matrice stdin/stdout attraverso `docker
+dvol` e l’immagine Docker ufficiale `rclone/rclone:latest`, usando una directory
+locale come remote filesystem. Verifica sul remote l’esistenza, la dimensione
+e la rilettura di ogni oggetto; quindi esegue restore diretto e `--spool` per
+backup singoli, bundle multi-volume e Compose, con tutte le compressioni. La
+matrice include anche stream troncati e verifica che i volumi non cambino. Se
+l’host non consente al processo utente di leggere i mountpoint Docker, lo
+script esegue il plugin in un container `docker:cli` con il socket Docker e il
+percorso dei volumi montati; in alternativa eseguire `sudo make acceptance`.
 
 Per eseguire uno script singolarmente, `DVOL_MODE=direct` è il default;
 `DVOL_MODE=docker` forza il passaggio attraverso il plugin installato:
