@@ -76,6 +76,35 @@ func TestFlatBackupStoresAndResolvesMultipleVolumes(t *testing.T) {
 	}
 }
 
+func TestFlatBackupIndexSupportsLz4(t *testing.T) {
+	s, destination := newFlatStore(t)
+	if err := s.Create("web", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.VolumePath("web"), "data.txt"), []byte("lz4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path, err := s.BackupWithOptions("web", BackupOptions{
+		Compression:     CompressionLz4,
+		ArchiveName:     "web-lz4",
+		SameDestination: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(path) != destination || !strings.HasSuffix(path, ".tar.lz4") {
+		t.Fatalf("unexpected lz4 flat archive path: %q", path)
+	}
+	infos, err := s.ListBackups("web")
+	if err != nil || len(infos) != 1 || infos[0].Path != path {
+		t.Fatalf("ListBackups(web): %+v err=%v", infos, err)
+	}
+	resolved, err := s.ResolveBackup("web", filepath.Base(path))
+	if err != nil || resolved != path {
+		t.Fatalf("ResolveBackup(web): got=%q want=%q err=%v", resolved, path, err)
+	}
+}
+
 func TestFlatBackupRejectsArchiveCollision(t *testing.T) {
 	s, _ := newFlatStore(t)
 	for _, name := range []string{"one", "two"} {

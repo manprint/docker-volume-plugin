@@ -122,22 +122,51 @@ archive_listing() {
 		*.tar.gz) tar -tzf "$archive" ;;
 		*.tar.xz) tar -tJf "$archive" ;;
 		*.tar.zst) tar --zstd -tf "$archive" ;;
+		*.tar.lz4) return 2 ;; # restore below validates lz4 when host tar lacks lz4 support
 		*) fail "unsupported archive: $archive" ;;
 	esac
 }
 
 assert_archive_contains() {
 	local archive="$1" entry="$2"
+	if [[ "$archive" == *.tar.lz4 ]]; then
+		echo "Skipping lz4 listing check; restore round-trip will validate the archive" >&2
+		return
+	fi
 	archive_listing "$archive" | sed 's#^\./##' | grep -Fx -- "$entry" >/dev/null \
 		|| fail "archive $archive does not contain $entry"
 }
 
 assert_archive_matches() {
 	local archive="$1" pattern="$2"
+	if [[ "$archive" == *.tar.lz4 ]]; then
+		echo "Skipping lz4 listing check; restore round-trip will validate the archive" >&2
+		return
+	fi
 	if ! archive_listing "$archive" | sed 's#^\./##' | grep -E -- "$pattern" >/dev/null; then
 		echo "Archive listing for diagnostic ($archive):" >&2
 		archive_listing "$archive" | sed -n '1,80p' >&2
 		fail "archive $archive does not contain an entry matching $pattern"
+	fi
+}
+
+balanced_level() {
+	printf '6\n'
+}
+
+default_compression_threads() {
+	local cpus
+	cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+	cpus=$((cpus / 2))
+	(( cpus > 0 )) || cpus=1
+	printf '%s\n' "$cpus"
+}
+
+compression_threads() {
+	if [[ "$1" == xz ]]; then
+		printf '1\n'
+	else
+		default_compression_threads
 	fi
 }
 
@@ -218,8 +247,10 @@ unpause_mongo_after_backup() {
 }
 
 backup_mongo_volumes() {
-	local compression="$1" output archive
-	output="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" mongo_data mongo_logs)"
+	local compression="$1" output archive level threads
+	level="$(balanced_level)"
+	threads="$(compression_threads "$compression")"
+	output="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" --level "$level" --threads "$threads" mongo_data mongo_logs)"
 	mapfile -t ARCHIVES < <(printf '%s\n' "$output" | sed -n 's/^backed up .* -> //p')
 	[[ ${#ARCHIVES[@]} -eq 2 ]] || fail "expected 2 backup archives, got ${#ARCHIVES[@]}"
 	DATA_ARCHIVE=""
@@ -246,10 +277,12 @@ backup_mongo_volumes() {
 }
 
 backup_flat_mongo_volumes() {
-	local compression="$1" destination="$2" output archive stamp
+	local compression="$1" destination="$2" output archive stamp level threads
+	level="$(balanced_level)"
+	threads="$(compression_threads "$compression")"
 	mkdir -p "$destination"
 	output="$(dvol_cmd --destination "$destination" backup \
-		--compression "$compression" \
+		--compression "$compression" --level "$level" --threads "$threads" \
 		--archive-name mongo_data::mongo-flat-data \
 		--archive-name mongo_logs::mongo-flat-logs \
 		--same-destination --timestamp mongo_data mongo_logs)"
@@ -440,7 +473,7 @@ main() {
 	mkdir -p "$ARCHIVE_ROOT"
 	require_image mongo:7
 	require_image busybox:1.36
-	for compression in gzip xz zstd; do
+	for compression in gzip xz zstd lz4; do
 		run_case compose "$compression"
 		run_case script "$compression"
 	done

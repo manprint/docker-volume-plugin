@@ -200,7 +200,7 @@ func TestCmdBackupCompression(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := &app{store: store, docker: dockerForStore(store, "web")}
-	a.cmdBackup([]string{"--compression", "xz", "--level", "6", "web"})
+	a.cmdBackup([]string{"--compression", "xz", "--level", "6", "--threads", "1", "web"})
 	infos, err := store.ListBackups("web")
 	if err != nil || len(infos) != 1 {
 		t.Fatalf("ListBackups: %+v err=%v", infos, err)
@@ -216,6 +216,33 @@ func TestCmdBackupCompression(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(store.VolumePath("web"), "data.txt"))
 	if err != nil || string(got) != "xz-data" {
 		t.Fatalf("expected xz-data, got %q err=%v", got, err)
+	}
+}
+
+func TestCmdBackupLz4CompressionAndThreads(t *testing.T) {
+	store := newCLIStore(t)
+	if err := store.Create("web", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.VolumePath("web"), "data.txt"), []byte("lz4-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{store: store, docker: dockerForStore(store, "web")}
+	a.cmdBackup([]string{"--compression", "lz4", "--level", "6", "--threads", "2", "web"})
+	infos, err := store.ListBackups("web")
+	if err != nil || len(infos) != 1 {
+		t.Fatalf("ListBackups: %+v err=%v", infos, err)
+	}
+	if got := infos[0].Name; !strings.HasSuffix(got, ".tar.lz4") {
+		t.Fatalf("expected .tar.lz4 archive, got %q", got)
+	}
+	if err := store.Remove("web"); err != nil {
+		t.Fatal(err)
+	}
+	a.cmdRestore([]string{"web"})
+	got, err := os.ReadFile(filepath.Join(store.VolumePath("web"), "data.txt"))
+	if err != nil || string(got) != "lz4-data" {
+		t.Fatalf("expected lz4-data, got %q err=%v", got, err)
 	}
 }
 

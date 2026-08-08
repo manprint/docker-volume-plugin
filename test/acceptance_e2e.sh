@@ -145,12 +145,17 @@ archive_listing() {
 		*.tar.gz) tar -tzf "$archive" ;;
 		*.tar.xz) tar -tJf "$archive" ;;
 		*.tar.zst) tar --zstd -tf "$archive" ;;
+		*.tar.lz4) return 2 ;; # restore below validates lz4 when host tar lacks lz4 support
 		*) fail "unsupported archive extension: $archive" ;;
 	esac
 }
 
 assert_archive_contains() {
 	local archive="$1" entry="$2"
+	if [[ "$archive" == *.tar.lz4 ]]; then
+		echo "Skipping lz4 listing check; restore round-trip will validate the archive" >&2
+		return
+	fi
 	if ! archive_listing "$archive" | sed 's#^\./##' | grep -Fx -- "$entry" >/dev/null; then
 		echo "Archive listing for diagnostic ($archive):" >&2
 		archive_listing "$archive" | sed -n '1,40p' >&2
@@ -158,9 +163,31 @@ assert_archive_contains() {
 	fi
 }
 
+balanced_level() {
+	printf '6\n'
+}
+
+default_compression_threads() {
+	local cpus
+	cpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+	cpus=$((cpus / 2))
+	(( cpus > 0 )) || cpus=1
+	printf '%s\n' "$cpus"
+}
+
+compression_threads() {
+	if [[ "$1" == xz ]]; then
+		printf '1\n'
+	else
+		default_compression_threads
+	fi
+}
+
 backup_single_volume() {
-	local volume="$1" compression="$2" archive
-	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" "$volume" \
+	local volume="$1" compression="$2" archive level threads
+	level="$(balanced_level)"
+	threads="$(compression_threads "$compression")"
+	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression "$compression" --level "$level" --threads "$threads" "$volume" \
 		| sed -n 's/^backed up .* -> //p')"
 	[[ -n "$archive" ]] || fail "backup did not report an archive for $volume"
 	assert_file "$archive"
@@ -249,7 +276,7 @@ run_odoo_scenario() {
 	local project="dvolaccept${BASHPID}${compression}"
 	local port
 	port="$(free_port)"
-	local archive before_db after_db before_odoo after_odoo
+	local archive before_db after_db before_odoo after_odoo level threads
 	local db_volume="${project}_db-data" odoo_volume="${project}_odoo-data"
 	local expected="2:odoo-alpha,odoo-beta"
 
@@ -275,8 +302,10 @@ run_odoo_scenario() {
 	docker compose -p "$project" -f "$ODOO_COMPOSE" stop >/dev/null
 	before_db="$(volume_manifest "$db_volume")"
 	before_odoo="$(volume_manifest "$odoo_volume")"
+	level="$(balanced_level)"
+	threads="$(compression_threads "$compression")"
 	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" compose-backup -f "$ODOO_COMPOSE" -p "$project" \
-			--compression "$compression" | sed -n 's/^backed up .* -> //p')"
+			--compression "$compression" --level "$level" --threads "$threads" | sed -n 's/^backed up .* -> //p')"
 	[[ -n "$archive" ]] || fail "Compose backup did not report an archive"
 	assert_file "$archive"
 	[[ -s "$archive" ]] || fail "Compose archive is empty: $archive"
@@ -337,7 +366,7 @@ main() {
 	require_image postgres:16
 	require_image odoo:17.0
 
-	for compression in gzip xz zstd; do
+	for compression in gzip xz zstd lz4; do
 		run_postgres_scenario "$compression"
 		run_odoo_scenario "$compression"
 	done

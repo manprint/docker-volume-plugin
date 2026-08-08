@@ -14,8 +14,14 @@ sudo make acceptance-mongo
 
 ## Matrice combinatoria
 
-Ogni riga viene eseguita per tutte le tre compressioni (`gzip`, `xz`, `zstd`).
-Il totale è quindi 18 casi: 2 bootstrap × 3 compressioni × 3 target di restore.
+Ogni riga viene eseguita per tutte le quattro compressioni (`gzip`, `xz`,
+`zstd`, `lz4`) e per entrambe le modalità client (`direct` e `docker dvol`).
+Il totale per modalità è quindi 24 percorsi di restore: 2 bootstrap × 4
+compressioni × 3 target di restore; l’esecuzione completa verifica 48 percorsi.
+
+Per ogni algoritmo la suite usa livello bilanciato `6` e il default CPU/2 per
+i thread, tranne `xz`, che usa esplicitamente un solo thread perché il suo
+encoder è single-threaded.
 
 | ID | Bootstrap | Target restore | Verifiche principali |
 | --- | --- | --- | --- |

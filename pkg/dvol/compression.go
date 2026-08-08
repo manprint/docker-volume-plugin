@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/klauspost/pgzip"
+	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
 )
 
@@ -19,15 +22,21 @@ const (
 	CompressionGzip Compression = "gzip"
 	CompressionXz   Compression = "xz"
 	CompressionZstd Compression = "zstd"
+	CompressionLz4  Compression = "lz4"
 )
 
 // BackupOptions controls the compression of backup archives.
 type BackupOptions struct {
 	// Compression format; empty means gzip (backward-compatible default).
 	Compression Compression
-	// Level is the compression level; 0 means the format default.
-	// gzip: 1-9, xz: 0-9 presets, zstd: 1-22.
+	// Level is the compression level; 0 means the balanced default for the
+	// selected format. gzip: 1-9, xz: 0-9 presets, zstd: 1-22, lz4: 1-9
+	// high-compression presets (0 is the fast preset).
 	Level int
+	// Threads is the requested compression concurrency; 0 means half of the
+	// host CPU count (minimum 1). xz is currently single-threaded and ignores
+	// the default value, but accepts an explicit value of 1.
+	Threads int
 	// ArchiveName is an optional archive name stem. The compression suffix is
 	// added automatically; a .tar.* suffix supplied by callers is accepted.
 	ArchiveName string
@@ -52,7 +61,7 @@ func (o BackupOptions) norm() BackupOptions {
 // Validate reports an error for an unsupported format or out-of-range level.
 func (o BackupOptions) Validate() error {
 	if o.ArchiveName != "" {
-		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd"} {
+		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd", ".tar.lz4"} {
 			o.ArchiveName = strings.TrimSuffix(o.ArchiveName, suffix)
 		}
 		if o.ArchiveName == "" || o.ArchiveName == "." || o.ArchiveName == ".." ||
@@ -63,18 +72,28 @@ func (o BackupOptions) Validate() error {
 	switch o.norm().Compression {
 	case CompressionGzip:
 		if o.Level < 0 || o.Level > 9 {
-			return fmt.Errorf("invalid gzip level %d (1-9, 0 = default)", o.Level)
+			return fmt.Errorf("invalid gzip level %d (1-9, 0 = balanced default)", o.Level)
 		}
 	case CompressionXz:
 		if o.Level < 0 || o.Level > 9 {
 			return fmt.Errorf("invalid xz level %d (0-9 presets, 0 = default)", o.Level)
 		}
+		if o.Threads < 0 || o.Threads > 1 {
+			return fmt.Errorf("xz supports only one compression thread")
+		}
 	case CompressionZstd:
 		if o.Level < 0 || o.Level > 22 {
-			return fmt.Errorf("invalid zstd level %d (1-22, 0 = default)", o.Level)
+			return fmt.Errorf("invalid zstd level %d (1-22, 0 = balanced default)", o.Level)
+		}
+	case CompressionLz4:
+		if o.Level < 0 || o.Level > 9 {
+			return fmt.Errorf("invalid lz4 level %d (1-9 high-compression presets, 0 = balanced default)", o.Level)
 		}
 	default:
-		return fmt.Errorf("unsupported compression %q (use gzip, xz or zstd)", o.Compression)
+		return fmt.Errorf("unsupported compression %q (use gzip, xz, zstd or lz4)", o.Compression)
+	}
+	if o.Threads < 0 {
+		return fmt.Errorf("invalid compression threads %d (must be >= 0)", o.Threads)
 	}
 	return nil
 }
@@ -86,9 +105,43 @@ func (o BackupOptions) ext() string {
 		return "xz"
 	case CompressionZstd:
 		return "zst"
+	case CompressionLz4:
+		return "lz4"
 	default:
 		return "gz"
 	}
+}
+
+func balancedLevel(compression Compression) int {
+	switch compression {
+	case CompressionGzip, CompressionXz, CompressionLz4:
+		return 6
+	case CompressionZstd:
+		return 6
+	default:
+		return 0
+	}
+}
+
+func compressionThreads(threads int) int {
+	if threads > 0 {
+		return threads
+	}
+	n := runtime.NumCPU() / 2
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+func lz4CompressionLevel(level int) lz4.CompressionLevel {
+	if level <= 0 {
+		level = balancedLevel(CompressionLz4)
+	}
+	if level == 0 {
+		return lz4.Fast
+	}
+	return lz4.CompressionLevel(1 << (8 + level))
 }
 
 // newWriter wraps w with the configured compressor.
@@ -98,18 +151,43 @@ func (o BackupOptions) newWriter(w io.Writer) (io.WriteCloser, error) {
 	case CompressionGzip:
 		lvl := o.Level
 		if lvl == 0 {
-			lvl = gzip.DefaultCompression
+			lvl = balancedLevel(CompressionGzip)
 		}
-		return gzip.NewWriterLevel(w, lvl)
+		zw, err := pgzip.NewWriterLevel(w, lvl)
+		if err != nil {
+			return nil, err
+		}
+		if err := zw.SetConcurrency(1<<20, compressionThreads(o.Threads)); err != nil {
+			_ = zw.Close()
+			return nil, err
+		}
+		return zw, nil
 	case CompressionXz:
+		if o.Level == 0 {
+			o.Level = balancedLevel(CompressionXz)
+		}
 		cfg := xz.WriterConfig{DictCap: xzDictCap(o.Level)}
 		return cfg.NewWriter(w)
 	case CompressionZstd:
-		var eopts []zstd.EOption
-		if o.Level != 0 {
-			eopts = append(eopts, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(o.Level)))
+		level := o.Level
+		if level == 0 {
+			level = balancedLevel(CompressionZstd)
 		}
+		var eopts []zstd.EOption
+		eopts = append(eopts,
+			zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
+			zstd.WithEncoderConcurrency(compressionThreads(o.Threads)),
+		)
 		return zstd.NewWriter(w, eopts...)
+	case CompressionLz4:
+		zw := lz4.NewWriter(w)
+		if err := zw.Apply(
+			lz4.CompressionLevelOption(lz4CompressionLevel(o.Level)),
+			lz4.ConcurrencyOption(compressionThreads(o.Threads)),
+		); err != nil {
+			return nil, err
+		}
+		return zw, nil
 	}
 	return nil, fmt.Errorf("unsupported compression %q", o.Compression)
 }
@@ -140,7 +218,8 @@ func xzDictCap(level int) int {
 
 // isArchiveName reports whether n looks like a dvol backup archive.
 func isArchiveName(n string) bool {
-	return strings.HasSuffix(n, ".tar.gz") || strings.HasSuffix(n, ".tar.xz") || strings.HasSuffix(n, ".tar.zst")
+	return strings.HasSuffix(n, ".tar.gz") || strings.HasSuffix(n, ".tar.xz") ||
+		strings.HasSuffix(n, ".tar.zst") || strings.HasSuffix(n, ".tar.lz4")
 }
 
 // openArchive opens a backup archive, detecting the compression format from
@@ -174,9 +253,14 @@ func openArchive(path string) (*tar.Reader, io.ReadCloser, *os.File, error) {
 			}
 		}
 		err = e
+	case strings.HasSuffix(path, ".tar.lz4"):
+		r = readCloser{
+			Reader: lz4.NewReader(f),
+			close:  func() error { return nil },
+		}
 	default:
 		f.Close()
-		return nil, nil, nil, fmt.Errorf("unsupported archive format %q (use .tar.gz, .tar.xz or .tar.zst)", path)
+		return nil, nil, nil, fmt.Errorf("unsupported archive format %q (use .tar.gz, .tar.xz, .tar.zst or .tar.lz4)", path)
 	}
 	if err != nil {
 		f.Close()

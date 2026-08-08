@@ -114,19 +114,39 @@ docker dvol backup app db cache
 docker dvol backup app,db,cache
 ```
 
-Il formato predefinito è `tar.gz`. Sono disponibili `gzip`, `xz` e `zstd`:
+Il formato predefinito è `tar.gz`. Sono disponibili `gzip`, `xz`, `zstd` e
+`lz4`:
 
 ```bash
 docker dvol backup --compression gzip app
 docker dvol backup --compression xz --level 6 app
 docker dvol backup --compression zstd --level 10 app
+docker dvol backup --compression lz4 --level 6 --threads 4 app
 ```
+
+Tutti gli algoritmi usano un livello bilanciato quando `--level` è omesso o
+vale `0`. Il default bilanciato è il livello `6` per `gzip`, `xz`, `zstd` e
+`lz4`. Gli archivi prodotti sono compatibili con i rispettivi formati:
+`.tar.gz`, `.tar.xz`, `.tar.zst` e `.tar.lz4`.
+
+| Algoritmo | Livelli supportati | Default | Thread |
+| --- | --- | --- | --- |
+| `gzip` (pgzip) | 1-9 | 6 | default CPU/2 |
+| `xz` | preset 0-9 | 6 | sempre 1: la libreria xz è single-threaded |
+| `zstd` | 1-22 | 6 | default CPU/2 |
+| `lz4` | 1-9 high-compression | 6 | default CPU/2 |
+
+Il numero predefinito di thread è `max(1, numero_cpu/2)`. Per `xz`,
+`--threads` può essere omesso oppure impostato a `1`; valori superiori vengono
+rifiutati perché non possono essere applicati dall’encoder. `gzip` usa
+`pgzip`, che produce gzip standard decomprimibile con gli strumenti normali.
 
 Opzioni di `backup`:
 
 ```text
---compression <gzip|xz|zstd>  formato, default gzip
---level <n>                   livello, 0 usa il default del formato
+--compression <gzip|xz|zstd|lz4> formato, default gzip
+--level <n>                      livello, 0 usa il default bilanciato (6)
+--threads <n>                    thread, 0 = max(1, numero_cpu/2); xz usa 1
 --archive-name VALUE          flag ripetibile; con un volume: nome base;
                               con più volumi: VOLUME::NOME
 --name VALUE                  alias di --archive-name
@@ -134,6 +154,9 @@ Opzioni di `backup`:
                               default: false, mantiene <destination>/<volume>/
 --timestamp                   aggiunge _ddmmyyyy_HHMMSS; default: false
 ```
+
+Le stesse opzioni `--compression`, `--level` e `--threads` sono disponibili
+anche per `docker dvol compose-backup`.
 
 Per esempio, per ottenere un backup MongoDB nella directory richiesta con
 nome leggibile e timestamp:
@@ -326,7 +349,7 @@ Il target va eseguito dalla directory root del repository, non da
 `sudo make -C ../.. acceptance`.
 
 `make acceptance` esegue gli scenari PostgreSQL e Odoo con tutte le
-compressioni (`gzip`, `xz`, `zstd`) due volte: prima usando il binario
+compressioni (`gzip`, `xz`, `zstd`, `lz4`) due volte: prima usando il binario
 direttamente e poi usando realmente il comando installato `docker dvol`.
 Prima dell’esecuzione copia il binario CLI in
 `$HOME/.docker/cli-plugins/docker-dvol` dell’utente effettivo (quindi in

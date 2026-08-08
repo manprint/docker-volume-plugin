@@ -209,8 +209,9 @@ func (a *app) cmdBackups(args []string) {
 // cmdBackup: docker dvol backup [options] <volume>...
 func (a *app) cmdBackup(args []string) {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
-	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
-	level := fs.Int("level", 0, "compression level (0 = format default)")
+	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd or lz4")
+	level := fs.Int("level", 0, "compression level (0 = balanced default)")
+	threads := fs.Int("threads", 0, "compression threads (0 = half of CPU count; xz uses one)")
 	var archiveNames multiFlag
 	fs.Var(&archiveNames, "archive-name", "archive name stem or volume::archive-name (repeatable)")
 	fs.Var(&archiveNames, "name", "alias for --archive-name")
@@ -221,13 +222,13 @@ func (a *app) cmdBackup(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Timestamp: includeTimestamp, SameDestination: sameDestination}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, Timestamp: includeTimestamp, SameDestination: sameDestination}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
 	names := expandNames(fs.Args())
 	if len(names) == 0 {
-		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...")
+		fail("usage: docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd|lz4] [--level N] [--threads N] <volume>...")
 	}
 	archiveMap, err := parseArchiveNames(archiveNames, names)
 	if err != nil {
@@ -312,8 +313,9 @@ func (a *app) cmdComposeBackup(args []string) {
 	fs := flag.NewFlagSet("compose-backup", flag.ContinueOnError)
 	var files multiFlag
 	project := fs.String("p", "", "project name")
-	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd")
-	level := fs.Int("level", 0, "compression level (0 = format default)")
+	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd or lz4")
+	level := fs.Int("level", 0, "compression level (0 = balanced default)")
+	threads := fs.Int("threads", 0, "compression threads (0 = half of CPU count; xz uses one)")
 	archiveName := ""
 	fs.StringVar(&archiveName, "archive-name", "", "archive name stem (suffix is added automatically)")
 	fs.StringVar(&archiveName, "name", "", "alias for --archive-name")
@@ -324,7 +326,7 @@ func (a *app) cmdComposeBackup(args []string) {
 		fail(err)
 	}
 
-	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, ArchiveName: archiveName, Timestamp: includeTimestamp}
+	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, ArchiveName: archiveName, Timestamp: includeTimestamp}
 	if err := opts.Validate(); err != nil {
 		fail(err)
 	}
@@ -409,9 +411,9 @@ func (a *app) usage() {
 Usage:
   docker dvol list                        list volumes
   docker dvol backups <volume>            list backups of a volume
-	  docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd] [--level N] <volume>...  backup one or more volumes
+	  docker dvol backup [--destination DIR] [--archive-name NAME|VOLUME::NAME] [--same-destination] [--timestamp] [--compression gzip|xz|zstd|lz4] [--level N] [--threads N] <volume>...  backup one or more volumes
   docker dvol restore <volume>... [backup]  restore volumes (optional backup for a single volume)
-	  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N]   backup all volumes of a compose project into one archive
+	  docker dvol compose-backup [-f file.yml] [-p project] [--compression c] [--level N] [--threads N]   backup all volumes of a compose project into one archive
   docker dvol compose-restore [-f file.yml] [-p project] [archive]  restore them
 
 Global flags: --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)

@@ -274,5 +274,6 @@ func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, p
 
 func isArchiveFileName(name string) bool {
 	return filepath.Base(name) == name &&
-		(strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tar.xz") || strings.HasSuffix(name, ".tar.zst"))
+		(strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tar.xz") ||
+			strings.HasSuffix(name, ".tar.zst") || strings.HasSuffix(name, ".tar.lz4"))
 }
