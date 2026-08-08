@@ -439,10 +439,20 @@ completo, non selettivo. Fermare o quiescere i servizi prima del restore.
 
 ## Consistenza e interruzioni
 
-Il backup legge il volume senza modificarlo. La lettura, però, non è una
-snapshot filesystem: se un container scrive durante `tar`, l’archivio può
-contenere dati provenienti da istanti diversi. Per una copia coerente fermare
-prima i container:
+Il backup è progettato come operazione strettamente read-only sul volume
+sorgente. Prima di iniziare rifiuta una sorgente che sia un symlink e rifiuta
+una destinazione locale collocata dentro il volume. La traversata usa
+descriptor Linux `O_NOFOLLOW|O_NOATIME`, verifica l’identità degli inode prima
+di leggere e preserva anche i timestamp dei symlink; se il filesystem non
+consente una lettura senza aggiornare l’atime, il backup fallisce invece di
+procedere in modo non sicuro.
+
+Queste garanzie proteggono il volume dall’azione di dvol, anche in caso di
+errore dello stream, errore di scrittura remoto o processo terminato durante
+la creazione dell’archivio. Non costituiscono però una snapshot filesystem: se
+un container scrive durante la lettura, l’archivio può contenere dati
+provenienti da istanti diversi. Per una copia coerente fermare prima i
+container:
 
 ```bash
 docker compose stop
@@ -456,6 +466,13 @@ In caso di crash durante il backup:
 - il volume sorgente non viene modificato;
 - un archivio temporaneo incompleto non viene pubblicato;
 - gli archivi già pubblicati restano validi.
+
+La destinazione dell’archivio deve essere esterna a tutti i volumi sorgente.
+Questo comando viene rifiutato prima di creare file:
+
+```bash
+docker dvol backup --destination "$(docker volume inspect -f '{{.Mountpoint}}' app)/backup" app
+```
 
 In modalità `--stdout` non viene creato il file temporaneo dell’archivio: se il
 consumer remoto interrompe la pipe, dvol segnala l’errore e non può controllare
@@ -535,8 +552,12 @@ modalità. La matrice è basata sui file
 `test/acceptance/script-start.mongo.sh`; il dettaglio è in
 `test/acceptance/mongo_test_matrix.md`.
 
-I test unitari coprono backup read-only, restore atomico, rollback,
-compressione, bundle Compose, interruzioni e gestione di mountpoint Docker.
+I test unitari coprono backup read-only con verifica di contenuto, ownership,
+permessi, mtime, atime, symlink e hardlink; destinazioni non sicure, errori di
+writer, stream troncati e processo terminato durante il publish; restore
+atomico, rollback, compressione, bundle Compose, interruzioni e gestione di
+mountpoint Docker. `make acceptance-stream` ripete inoltre le verifiche di
+invariabilità sui volumi Docker reali durante backup singoli, bundle e Compose.
 
 ## Layout
 

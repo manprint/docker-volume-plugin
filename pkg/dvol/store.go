@@ -27,7 +27,11 @@ func NewStore(cfg Config) (*Store, error) {
 		cfg.Root = DefaultRoot
 	}
 	s := &Store{cfg: cfg}
-	for _, d := range []string{cfg.Root, s.volumesDir(), s.metaDir(), s.backupsDir()} {
+	// Do not create the archive destination during store initialization. The
+	// CLI may receive a destination that is inside a Docker volume source; the
+	// backup path validates that relationship before creating any destination
+	// directory. Archive/index operations create backupsDir lazily.
+	for _, d := range []string{cfg.Root, s.volumesDir(), s.metaDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", d, err)
 		}

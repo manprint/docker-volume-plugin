@@ -10,9 +10,12 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -24,6 +27,7 @@ type treeNode struct {
 	mode  os.FileMode
 	uid   int
 	gid   int
+	atime time.Time
 	mtime time.Time
 	size  int64
 	link  string // symlink target, "" for non-symlinks
@@ -35,36 +39,15 @@ type treeNode struct {
 func snapshotTree(t *testing.T, root string) map[string]treeNode {
 	t.Helper()
 	out := map[string]treeNode{}
-	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel := "."
-		if p != root {
-			re, err := filepath.Rel(root, p)
-			if err != nil {
-				return err
-			}
-			rel = re
-		}
-		n := treeNode{
-			mode:  info.Mode(),
-			size:  info.Size(),
-			mtime: info.ModTime(),
-		}
+	add := func(rel string, info os.FileInfo, content io.Reader, link string) error {
+		n := treeNode{mode: info.Mode(), size: info.Size(), mtime: info.ModTime(), link: link}
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
 			n.uid = int(st.Uid)
 			n.gid = int(st.Gid)
+			n.atime = time.Unix(st.Atim.Sec, st.Atim.Nsec)
 		}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			link, err := os.Readlink(p)
-			if err != nil {
-				return err
-			}
-			n.link = link
-		case info.Mode().IsRegular():
-			b, err := os.ReadFile(p)
+		if content != nil && info.Mode().IsRegular() {
+			b, err := io.ReadAll(content)
 			if err != nil {
 				return err
 			}
@@ -74,6 +57,16 @@ func snapshotTree(t *testing.T, root string) map[string]treeNode {
 		}
 		out[rel] = n
 		return nil
+	}
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	if err := add(".", rootInfo, nil, ""); err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	err = walkReadOnly(root, func(entry readOnlyTreeEntry) error {
+		return add(entry.rel, entry.info, entry.file, entry.link)
 	})
 	if err != nil {
 		t.Fatalf("snapshot %s: %v", root, err)
@@ -96,6 +89,9 @@ func assertTreeUnchanged(t *testing.T, root, label string, before, after map[str
 		}
 		if a.uid != b.uid || a.gid != b.gid {
 			diffs = append(diffs, fmt.Sprintf("%s: owner %d:%d -> %d:%d", rel, b.uid, b.gid, a.uid, a.gid))
+		}
+		if !a.atime.Equal(b.atime) {
+			diffs = append(diffs, fmt.Sprintf("%s: atime %v -> %v", rel, b.atime, a.atime))
 		}
 		if !a.mtime.Equal(b.mtime) {
 			diffs = append(diffs, fmt.Sprintf("%s: mtime %v -> %v", rel, b.mtime, a.mtime))
@@ -167,7 +163,7 @@ func makeRichVolume(t *testing.T, s *Store, name string) map[string]treeNode {
 // strictly read-only with respect to the source volume, in every supported
 // compression format.
 func TestBackupNeverModifiesSource(t *testing.T) {
-	for _, c := range []Compression{CompressionGzip, CompressionXz, CompressionZstd} {
+	for _, c := range []Compression{CompressionGzip, CompressionXz, CompressionZstd, CompressionLz4} {
 		t.Run(string(c), func(t *testing.T) {
 			s := newTestStore(t)
 			before := makeRichVolume(t, s, "web")
@@ -177,6 +173,110 @@ func TestBackupNeverModifiesSource(t *testing.T) {
 			assertTreeUnchanged(t, s.VolumePath("web"), "source volume after Backup("+string(c)+")", before, snapshotTree(t, s.VolumePath("web")))
 		})
 	}
+}
+
+func TestBackupRejectsUnsafeSourceAndDestination(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data.txt"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(Config{
+		Root:       filepath.Join(root, "store"),
+		BackupsDir: filepath.Join(source, "backups"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, source)
+	if _, err := store.BackupSourceWithOptions("web", source, BackupOptions{ArchiveName: "inside"}); err == nil {
+		t.Fatal("backup destination inside source was accepted")
+	}
+	assertTreeUnchanged(t, source, "source after unsafe destination rejection", before, snapshotTree(t, source))
+	if _, err := os.Stat(filepath.Join(source, "backups")); !os.IsNotExist(err) {
+		t.Fatalf("unsafe destination created a directory: %v", err)
+	}
+
+	link := filepath.Join(root, "source-link")
+	if err := os.Symlink(source, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BackupSourceWithOptions("link", link, BackupOptions{}); err == nil {
+		t.Fatal("symlink source was accepted")
+	}
+	destinationLink := filepath.Join(root, "destination-link")
+	if err := os.Symlink(source, destinationLink); err != nil {
+		t.Fatal(err)
+	}
+	linkedDestinationStore, err := NewStore(Config{
+		Root:       filepath.Join(root, "linked-store"),
+		BackupsDir: destinationLink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := linkedDestinationStore.BackupSourceWithOptions("web", source, BackupOptions{}); err == nil {
+		t.Fatal("destination symlink into source was accepted")
+	}
+}
+
+func TestReadOnlyOpenRejectsEntryReplacement(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "data")
+	if err := os.WriteFile(path, []byte("safe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	expected, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Fatal(err)
+	}
+	if file, _, err := openReadOnlyAt(parent, "data", expected); err == nil {
+		_ = file.Close()
+		t.Fatal("replaced source entry was opened")
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "outside" {
+		t.Fatalf("replacement target was touched: %q err=%v", got, err)
+	}
+}
+
+func TestBackupBundleRejectsDestinationInsideAnySource(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "volume")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data.txt"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(Config{Root: filepath.Join(root, "store")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotTree(t, source)
+	if _, err := s.BackupBundleSourcesWithOptions(
+		[]string{"web"}, map[string]string{"web": source}, filepath.Join(source, "bundle-destination"), "bundle", BackupOptions{},
+	); err == nil {
+		t.Fatal("bundle destination inside source was accepted")
+	}
+	assertTreeUnchanged(t, source, "source after unsafe bundle destination rejection", before, snapshotTree(t, source))
 }
 
 // TestBackupInterruptionKeepsSourceAndExistingArchive verifies the failure
@@ -212,6 +312,125 @@ func TestBackupInterruptionKeepsSourceAndExistingArchive(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != filepath.Base(final) {
 		t.Fatalf("temporary archive was left behind after interruption: %v", entries)
+	}
+}
+
+type sourceInvariantFailWriter struct{ remaining int }
+
+func (w *sourceInvariantFailWriter) Write(p []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, fmt.Errorf("simulated remote write failure")
+	}
+	if len(p) > w.remaining {
+		n := w.remaining
+		w.remaining = 0
+		return n, fmt.Errorf("simulated remote write failure")
+	}
+	w.remaining -= len(p)
+	return len(p), nil
+}
+
+func TestBackupStreamWriterFailureKeepsSource(t *testing.T) {
+	s := newTestStore(t)
+	before := makeRichVolume(t, s, "web")
+	var out sourceInvariantFailWriter
+	if err := s.BackupSourceToWriter("web", s.VolumePath("web"), BackupOptions{Compression: CompressionZstd}, &out); err == nil {
+		t.Fatal("failing stream writer unexpectedly accepted")
+	}
+	assertTreeUnchanged(t, s.VolumePath("web"), "source after failed stdout backup", before, snapshotTree(t, s.VolumePath("web")))
+}
+
+func TestConcurrentBackupsNeverModifySource(t *testing.T) {
+	s := newTestStore(t)
+	before := makeRichVolume(t, s, "web")
+	compressions := []Compression{CompressionGzip, CompressionXz, CompressionZstd, CompressionLz4}
+	errs := make(chan error, len(compressions))
+	var wg sync.WaitGroup
+	for _, compression := range compressions {
+		compression := compression
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var out bytes.Buffer
+			errs <- s.BackupSourceToWriter("web", s.VolumePath("web"), BackupOptions{
+				Compression: compression,
+				Threads:     1,
+			}, &out)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertTreeUnchanged(t, s.VolumePath("web"), "source after concurrent backups", before, snapshotTree(t, s.VolumePath("web")))
+}
+
+// TestBackupCrashHelper is run in a child process by
+// TestBackupProcessCrashKeepsSource. It intentionally stops after the source
+// has been read but before the archive is published.
+func TestBackupCrashHelper(t *testing.T) {
+	if os.Getenv("DVOL_BACKUP_CRASH_HELPER") != "1" {
+		return
+	}
+	err := writeArchive(os.Getenv("DVOL_BACKUP_CRASH_ARCHIVE"), BackupOptions{}, func(tw *tar.Writer) error {
+		if err := addTreeTo(tw, os.Getenv("DVOL_BACKUP_CRASH_SOURCE"), ""); err != nil {
+			return err
+		}
+		if err := os.WriteFile(os.Getenv("DVOL_BACKUP_CRASH_READY"), []byte("ready"), 0o644); err != nil {
+			return err
+		}
+		select {}
+	})
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestBackupProcessCrashKeepsSource(t *testing.T) {
+	s := newTestStore(t)
+	before := makeRichVolume(t, s, "web")
+	outDir := t.TempDir()
+	archive := filepath.Join(outDir, "web.tar.gz")
+	if err := os.WriteFile(archive, []byte("previous valid archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBackupCrashHelper$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"DVOL_BACKUP_CRASH_HELPER=1",
+		"DVOL_BACKUP_CRASH_SOURCE="+s.VolumePath("web"),
+		"DVOL_BACKUP_CRASH_ARCHIVE="+archive,
+		"DVOL_BACKUP_CRASH_READY="+ready,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatal("crash helper did not reach the publish boundary")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("crash helper exited cleanly")
+	}
+
+	assertTreeUnchanged(t, s.VolumePath("web"), "source after killed backup", before, snapshotTree(t, s.VolumePath("web")))
+	got, err := os.ReadFile(archive)
+	if err != nil || string(got) != "previous valid archive" {
+		t.Fatalf("existing archive was replaced after crash: %q err=%v", got, err)
 	}
 }
 

@@ -72,22 +72,21 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 	if err := opts.Validate(); err != nil {
 		return "", err
 	}
-	fi, err := os.Stat(source)
-	if err != nil {
-		return "", fmt.Errorf("volume source %q: %w", source, err)
-	}
-	if !fi.IsDir() {
-		return "", fmt.Errorf("volume source %q is not a directory", source)
+	if _, err := validateBackupSource(source); err != nil {
+		return "", err
 	}
 	bdir := s.backupDir(name)
 	if opts.SameDestination {
 		bdir = s.backupsDir()
 	}
+	archiveName := archiveFilename(name, opts)
+	path := filepath.Join(bdir, archiveName)
+	if err := ensureBackupDestinationOutsideSources(path, source); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return "", err
 	}
-	archiveName := archiveFilename(name, opts)
-	path := filepath.Join(bdir, archiveName)
 	if opts.SameDestination {
 		if err := s.writeFlatBackup(name, archiveName, path, opts, func(tw *tar.Writer) error {
 			return addTreeTo(tw, source, "")
@@ -111,12 +110,8 @@ func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w 
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	fi, err := os.Stat(source)
-	if err != nil {
-		return fmt.Errorf("volume source %q: %w", source, err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("volume source %q is not a directory", source)
+	if _, err := validateBackupSource(source); err != nil {
+		return err
 	}
 	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
 		return addTreeTo(tw, source, "")
@@ -176,19 +171,20 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 		if !ok {
 			return "", fmt.Errorf("no source for volume %q", name)
 		}
-		fi, err := os.Stat(source)
-		if err != nil {
-			return "", fmt.Errorf("volume source %q: %w", source, err)
-		}
-		if !fi.IsDir() {
-			return "", fmt.Errorf("volume source %q is not a directory", source)
+		if _, err := validateBackupSource(source); err != nil {
+			return "", err
 		}
 	}
 
+	path := filepath.Join(outDir, archiveFilename(prefix, opts))
+	for _, name := range clean {
+		if err := ensureBackupDestinationOutsideSources(path, sources[name]); err != nil {
+			return "", err
+		}
+	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(outDir, archiveFilename(prefix, opts))
 	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
 		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
 		mb, err := json.Marshal(mf)
@@ -233,12 +229,8 @@ func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]s
 		if !ok {
 			return fmt.Errorf("no source for volume %q", name)
 		}
-		fi, err := os.Stat(source)
-		if err != nil {
-			return fmt.Errorf("volume source %q: %w", source, err)
-		}
-		if !fi.IsDir() {
-			return fmt.Errorf("volume source %q is not a directory", source)
+		if _, err := validateBackupSource(source); err != nil {
+			return err
 		}
 	}
 	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
@@ -405,13 +397,251 @@ func syncDir(path string) error {
 	return d.Close()
 }
 
+// validateBackupSource rejects symlink roots and verifies that the source can
+// be opened without write access or atime side effects. Docker volume
+// mountpoints are real directories, so accepting a symlink here would only
+// add a race in which a path can be redirected outside the volume.
+func validateBackupSource(source string) (os.FileInfo, error) {
+	info, err := os.Lstat(source)
+	if err != nil {
+		return nil, fmt.Errorf("volume source %q: %w", source, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("volume source %q must not be a symlink", source)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("volume source %q is not a directory", source)
+	}
+	dir, actual, err := openReadOnlyDir(source, info)
+	if err != nil {
+		return nil, fmt.Errorf("volume source %q cannot be opened safely: %w", source, err)
+	}
+	if err := dir.Close(); err != nil {
+		return nil, fmt.Errorf("volume source %q: close: %w", source, err)
+	}
+	return actual, nil
+}
+
+// resolvedPath follows only the existing portion of path. This lets us detect
+// a destination whose parent is a symlink into the source even when the final
+// archive file does not exist yet.
+func resolvedPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	var suffix []string
+	cur := abs
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			resolved, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				return "", err
+			}
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+func pathWithin(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// ensureBackupDestinationOutsideSources prevents the archive, temporary file,
+// flat index and lock file from ever being created inside a source volume.
+// Writing an archive into the volume being backed up would violate the core
+// read-only contract even though the tar traversal itself only reads.
+func ensureBackupDestinationOutsideSources(destination string, sources ...string) error {
+	dest, err := resolvedPath(destination)
+	if err != nil {
+		return fmt.Errorf("resolve backup destination %q: %w", destination, err)
+	}
+	for _, source := range sources {
+		root, err := resolvedPath(source)
+		if err != nil {
+			return fmt.Errorf("resolve volume source %q: %w", source, err)
+		}
+		if pathWithin(root, dest) {
+			return fmt.Errorf("backup destination %q is inside source volume %q", destination, source)
+		}
+	}
+	return nil
+}
+
+const readOnlyOpenFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NOATIME
+
+func openReadOnlyDir(path string, expected os.FileInfo) (*os.File, os.FileInfo, error) {
+	fd, err := unix.Open(path, readOnlyOpenFlags|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	actual, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	if !os.SameFile(expected, actual) || !actual.IsDir() {
+		_ = f.Close()
+		return nil, nil, fmt.Errorf("source directory changed while opening")
+	}
+	return f, actual, nil
+}
+
+func openReadOnlyAt(parent *os.File, name string, expected os.FileInfo) (*os.File, os.FileInfo, error) {
+	flags := readOnlyOpenFlags
+	if expected.IsDir() {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := unix.Openat(int(parent.Fd()), name, flags, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name))
+	actual, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, err
+	}
+	if !os.SameFile(expected, actual) {
+		_ = f.Close()
+		return nil, nil, fmt.Errorf("source entry %q changed while opening", name)
+	}
+	return f, actual, nil
+}
+
+func readlinkAt(parent *os.File, name string) (string, error) {
+	// Opening the symlink itself with O_PATH|O_NOFOLLOW avoids following it
+	// and avoids the atime update caused by pathname readlink on some Linux
+	// filesystems. readlinkat with an empty path reads the O_PATH descriptor.
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(fd)
+	var original unix.Stat_t
+	if err := unix.Fstat(fd, &original); err != nil {
+		return "", err
+	}
+	buf := make([]byte, 256)
+	for {
+		n, err := unix.Readlinkat(fd, "", buf)
+		if err != nil {
+			return "", err
+		}
+		if n < len(buf) {
+			// Linux updates a symlink's atime when its target is read. Restore
+			// both timestamps through the O_PATH descriptor so the source
+			// remains byte- and metadata-identical after the backup.
+			times := []unix.Timespec{original.Atim, original.Mtim}
+			if err := unix.UtimesNanoAt(fd, "", times, unix.AT_EMPTY_PATH); err != nil {
+				return "", fmt.Errorf("restore symlink timestamps: %w", err)
+			}
+			return string(buf[:n]), nil
+		}
+		buf = append(buf, make([]byte, len(buf))...)
+	}
+}
+
+type readOnlyTreeEntry struct {
+	path string
+	rel  string
+	info os.FileInfo
+	link string
+	file *os.File
+}
+
+// walkReadOnly traverses a source using directory descriptors. It never
+// follows a symlink and opens regular files with O_NOATIME, so reading a
+// backup cannot mutate access times on the source. Opened descriptors are
+// checked against the original lstat result to detect replacement races.
+func walkReadOnly(root string, visit func(readOnlyTreeEntry) error) error {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	rootDir, _, err := openReadOnlyDir(root, rootInfo)
+	if err != nil {
+		return err
+	}
+	defer rootDir.Close()
+	return walkReadOnlyDir(rootDir, root, "", visit)
+}
+
+func walkReadOnlyDir(dir *os.File, dirPath, prefix string, visit func(readOnlyTreeEntry) error) error {
+	entries, err := dir.Readdir(-1)
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, discovered := range entries {
+		name := discovered.Name()
+		path := filepath.Join(dirPath, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		rel := name
+		if prefix != "" {
+			rel = filepath.Join(prefix, name)
+		}
+		entry := readOnlyTreeEntry{path: path, rel: filepath.ToSlash(rel), info: info}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			entry.link, err = readlinkAt(dir, name)
+			if err != nil {
+				return err
+			}
+			if err := visit(entry); err != nil {
+				return err
+			}
+		case info.IsDir() || info.Mode().IsRegular():
+			child, actual, err := openReadOnlyAt(dir, name, info)
+			if err != nil {
+				return err
+			}
+			entry.info = actual
+			entry.file = child
+			err = visit(entry)
+			if err == nil && actual.IsDir() {
+				err = walkReadOnlyDir(child, path, rel, visit)
+			}
+			closeErr := child.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		default:
+			if err := visit(entry); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // addTreeTo writes the volume root entry followed by every file under dir.
 // With prefix "" the root entry is "." (a plain volume backup); otherwise
 // entries are prefixed with "<prefix>/" (a bundle). Hard-linked files are
 // written once plus TypeLink entries, preserving inode sharing in both the
 // plain and the bundle layout.
 func addTreeTo(tw *tar.Writer, dir, prefix string) error {
-	rootInfo, err := os.Stat(dir)
+	rootInfo, err := validateBackupSource(dir)
 	if err != nil {
 		return err
 	}
@@ -425,63 +655,47 @@ func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 		return err
 	}
 	seen := map[[2]uint64]string{} // (dev,ino) -> first archive name
-	return filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if p == dir {
-			return nil // root entry already written
-		}
-		rel := filepath.ToSlash(strings.TrimPrefix(p, dir+string(filepath.Separator)))
-		name := rel
+	return walkReadOnly(dir, func(entry readOnlyTreeEntry) error {
+		name := entry.rel
 		if prefix != "" {
-			name = prefix + "/" + rel
+			name = prefix + "/" + name
 		}
-		link := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err = os.Readlink(p)
-			if err != nil {
-				return err
-			}
-		}
-		if info.Mode().IsRegular() {
-			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
+		if entry.info.Mode().IsRegular() {
+			if st, ok := entry.info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
 				key := [2]uint64{uint64(st.Dev), uint64(st.Ino)}
 				if first, ok := seen[key]; ok {
-					hdr, err := tar.FileInfoHeader(info, "")
+					hdr, err := tar.FileInfoHeader(entry.info, "")
 					if err != nil {
 						return err
 					}
 					hdr.Name = name
 					hdr.Typeflag = tar.TypeLink
 					hdr.Linkname = first
-					hdr.Mode |= specialModeBits(info.Mode())
+					hdr.Mode |= specialModeBits(entry.info.Mode())
 					return tw.WriteHeader(hdr)
 				}
 				seen[key] = name
 			}
 		}
-		hdr, err := tar.FileInfoHeader(info, link)
+		hdr, err := tar.FileInfoHeader(entry.info, entry.link)
 		if err != nil {
 			return err
 		}
 		hdr.Name = name
-		hdr.Mode |= specialModeBits(info.Mode())
-		if info.IsDir() {
+		hdr.Mode |= specialModeBits(entry.info.Mode())
+		if entry.info.IsDir() {
 			hdr.Name += "/"
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-		if !info.Mode().IsRegular() {
+		if !entry.info.Mode().IsRegular() {
 			return nil
 		}
-		sf, err := os.Open(p)
-		if err != nil {
-			return err
+		if entry.file == nil {
+			return fmt.Errorf("regular source entry %q was not opened read-only", entry.path)
 		}
-		defer sf.Close()
-		_, err = io.Copy(tw, sf)
+		_, err = io.Copy(tw, entry.file)
 		return err
 	})
 }

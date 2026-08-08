@@ -35,6 +35,7 @@ cleanup() {
   for volume in $VOLUMES; do docker volume rm -f "$volume" >/dev/null 2>&1; done
   for project in $COMPOSE_PROJECTS; do docker compose -p "$project" -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1; done
   if [[ -d "$REMOTE_ROOT" ]]; then docker run --rm -i -v "$REMOTE_ROOT:/remote" rclone/rclone:latest purge /remote >/dev/null 2>&1; fi
+  rm -f "$COMPOSE_FILE"
   rmdir "$REMOTE_ROOT" >/dev/null 2>&1 || true
   rmdir "$WORK_DIR" >/dev/null 2>&1 || true
 }
@@ -56,6 +57,27 @@ assert_volume() {
   local volume="$1" marker="$2"
   docker run --rm -v "$volume:/data" alpine:3.20 sh -ec "test \"\$(cat /data/data.txt)\" = '$marker'; test \"\$(cat /data/nested/value.txt)\" = 'nested-$marker'; test -L /data/link.txt; test \"\$(readlink /data/link.txt)\" = data.txt"
 }
+volume_state() {
+  local volume="$1"
+  docker run --rm -v "$volume:/data:ro" alpine:3.20 sh -ec '
+    find /data -xdev -print | sort | while IFS= read -r path; do
+      stat -c "%n|%F|%a|%u|%g|%s|%Y" "$path"
+      if [ -f "$path" ] && [ ! -L "$path" ]; then sha256sum "$path"; fi
+    done
+  '
+}
+volume_fingerprint() {
+  volume_state "$1" | sha256sum | awk '{print $1}'
+}
+assert_volume_unchanged() {
+  local volume="$1" before="$2" after
+  after="$(volume_fingerprint "$volume")"
+  if [[ "$before" != "$after" ]]; then
+    echo "Source state after backup ($volume):" >&2
+    volume_state "$volume" >&2
+    fail "source volume changed during backup: $volume ($before -> $after)"
+  fi
+}
 assert_remote_object() {
   local object="$1" size
   size="$(rclone_cmd size --json "$object" | tr -d '\n' | sed -n 's/.*"bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
@@ -73,7 +95,7 @@ compression_ext() {
 }
 
 run_single_matrix() {
-  local compression="$1" ext volume object marker status
+  local compression="$1" ext volume object marker status before mountpoint forbidden
   ext="$(compression_ext "$compression")"
   new_volume "single-$compression"
   volume="$NEW_VOLUME"
@@ -81,8 +103,21 @@ run_single_matrix() {
   populate_volume "$volume" "$marker"
   object="/remote/single/$volume.tar.$ext"
   echo "stream single backup/restore compression=$compression"
+  before="$(volume_fingerprint "$volume")"
   dvol_cmd backup --stdout --compression "$compression" --threads 1 "$volume" | rclone_cmd rcat "$object"
+  assert_volume_unchanged "$volume" "$before"
   assert_remote_object "$object"
+  if [[ "$compression" == gzip ]]; then
+    mountpoint="$(docker volume inspect -f '{{.Mountpoint}}' "$volume")"
+    forbidden="$mountpoint/.dvol-forbidden-output"
+    before="$(volume_fingerprint "$volume")"
+    set +e
+    dvol_cmd backup --destination "$forbidden" --archive-name forbidden "$volume" >/dev/null 2>&1
+    status=$?
+    set -e
+    (( status != 0 )) || fail "backup destination inside source was accepted"
+    assert_volume_unchanged "$volume" "$before"
+  fi
   docker run --rm -v "$volume:/data" alpine:3.20 sh -ec "printf '%s\n' changed > /data/data.txt; touch /data/temporary.txt"
   rclone_cmd cat "$object" | dvol_cmd restore --stdin "$volume"
   assert_volume "$volume" "$marker"
@@ -103,7 +138,7 @@ run_single_matrix() {
 }
 
 run_bundle_matrix() {
-  local compression="$1" ext v1 v2 object
+  local compression="$1" ext v1 v2 object before1 before2
   ext="$(compression_ext "$compression")"
   new_volume "bundle-$compression-data"
   v1="$NEW_VOLUME"
@@ -113,7 +148,11 @@ run_bundle_matrix() {
   populate_volume "$v2" "bundle-logs-$compression"
   object="/remote/bundle/$PROJECT-$compression.tar.$ext"
   echo "stream bundle backup/restore compression=$compression"
+  before1="$(volume_fingerprint "$v1")"
+  before2="$(volume_fingerprint "$v2")"
   dvol_cmd backup --stdout --bundle --compression "$compression" --threads 1 "$v1" "$v2" | rclone_cmd rcat "$object"
+  assert_volume_unchanged "$v1" "$before1"
+  assert_volume_unchanged "$v2" "$before2"
   assert_remote_object "$object"
   docker run --rm -v "$v1:/data" alpine:3.20 sh -ec 'printf changed > /data/data.txt; touch /data/temporary.txt'
   docker run --rm -v "$v2:/data" alpine:3.20 sh -ec 'printf changed > /data/data.txt; touch /data/temporary.txt'
@@ -125,7 +164,7 @@ run_bundle_matrix() {
 }
 
 run_compose_matrix() {
-  local compression="$1" ext object
+  local compression="$1" ext object before_data before_logs
   ext="$(compression_ext "$compression")"
   cat > "$COMPOSE_FILE" <<'YAML'
 services:
@@ -144,7 +183,11 @@ YAML
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" exec -T app sh -ec "printf '%s\n' compose-$compression > /data/data.txt; printf '%s\n' log-$compression > /logs/log.txt"
   object="/remote/compose/$PROJECT-$compression.tar.$ext"
   echo "stream compose backup/restore compression=$compression"
+  before_data="$(volume_fingerprint "${PROJECT}_data")"
+  before_logs="$(volume_fingerprint "${PROJECT}_logs")"
   dvol_cmd compose-backup --stdout -f "$COMPOSE_FILE" -p "$PROJECT" --compression "$compression" --threads 1 | rclone_cmd rcat "$object"
+  assert_volume_unchanged "${PROJECT}_data" "$before_data"
+  assert_volume_unchanged "${PROJECT}_logs" "$before_logs"
   assert_remote_object "$object"
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" down -v >/dev/null
   rclone_cmd cat "$object" | dvol_cmd compose-restore --stdin -f "$COMPOSE_FILE" -p "$PROJECT"
