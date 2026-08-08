@@ -32,7 +32,7 @@ type BackupOptions struct {
 	Compression Compression
 	// Level is the compression level; 0 means the balanced default for the
 	// selected format. gzip: 1-9, xz: 0-9 presets, zstd: 1-22, lz4: 1-9
-	// high-compression presets (0 is the fast preset).
+	// high-compression presets.
 	Level int
 	// Threads is the requested compression concurrency; 0 means half of the
 	// host CPU count (minimum 1). xz is currently single-threaded and ignores
@@ -65,15 +65,29 @@ func (o BackupOptions) norm() BackupOptions {
 	return o
 }
 
+// archiveSuffixes are the suffixes trimmed from a caller-supplied archive name
+// so `--archive-name foo.tar.zst` and `--archive-name foo` behave the same.
+var archiveSuffixes = []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd", ".tar.lz4"}
+
+func trimArchiveSuffix(name string) string {
+	for _, suffix := range archiveSuffixes {
+		if trimmed, ok := strings.CutSuffix(name, suffix); ok {
+			return trimmed
+		}
+	}
+	return name
+}
+
 // Validate reports an error for an unsupported format or out-of-range level.
 func (o BackupOptions) Validate() error {
 	if o.ArchiveName != "" {
-		for _, suffix := range []string{".tar.gz", ".tar.xz", ".tar.zst", ".tar.zstd", ".tar.lz4"} {
-			o.ArchiveName = strings.TrimSuffix(o.ArchiveName, suffix)
+		if err := checkArchiveStem(trimArchiveSuffix(o.ArchiveName)); err != nil {
+			return err
 		}
-		if o.ArchiveName == "" || o.ArchiveName == "." || o.ArchiveName == ".." ||
-			strings.ContainsAny(o.ArchiveName, `/\\:`) {
-			return fmt.Errorf("invalid archive name %q (use a file name, not a path)", o.ArchiveName)
+	}
+	if o.TimestampValue != "" {
+		if err := checkArchiveStem(o.TimestampValue); err != nil {
+			return fmt.Errorf("invalid timestamp value: %w", err)
 		}
 	}
 	switch o.norm().Compression {
@@ -141,12 +155,12 @@ func compressionThreads(threads int) int {
 	return n
 }
 
+// lz4CompressionLevel maps the 1-9 CLI presets onto pierrec/lz4 levels
+// (Level1 = 1<<9 ... Level9 = 1<<17). Level 0 means "balanced default", which
+// is 6 like every other format, so lz4.Fast is never selected implicitly.
 func lz4CompressionLevel(level int) lz4.CompressionLevel {
 	if level <= 0 {
 		level = balancedLevel(CompressionLz4)
-	}
-	if level == 0 {
-		return lz4.Fast
 	}
 	return lz4.CompressionLevel(1 << (8 + level))
 }

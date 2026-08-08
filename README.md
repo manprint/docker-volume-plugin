@@ -77,10 +77,26 @@ docker volume inspect app \
     default: <root>/backups
 
 --destination <dir>
-	 directory radice degli archivi; gli archivi dei singoli volumi sono
-	 organizzati in <dir>/<volume>/;
-	 default: <root>/backups
+    directory radice degli archivi; gli archivi dei singoli volumi sono
+    organizzati in <dir>/<volume>/;
+    default: <root>/backups
+
+--log-level <livello>
+    TRACE, DEBUG, INFO, WARN o ERROR; default: INFO
+
+--archive-mode <ottale>
+    permessi degli archivi pubblicati e del file di indice;
+    default: 0644. Usare 0600 per archivi leggibili solo dal proprietario
+
+--allow-atime
+    consente di leggere sorgenti che non possono essere aperte con O_NOATIME
+    (file di un altro utente senza privilegi di root, alcuni mount NFS);
+    default: il backup fallisce invece di aggiornare gli atime della sorgente
 ```
+
+Le opzioni globali possono precedere o seguire il sottocomando. Dopo `--` non
+vengono più interpretate, quindi un valore che assomiglia a un flag globale
+resta al sottocomando.
 
 Il repository contiene solo gli archivi; non contiene i dati operativi dei
 volumi Docker. Esempio:
@@ -288,8 +304,10 @@ docker dvol backup --stdout --bundle --compression zstd \
   | rclone rcat myremote:/dumps/odoo/odoo-volumes.tar.zst
 ```
 
-Con più volumi, omettere `--bundle` è un errore. Il bundle viene ripristinato
-completo; non è previsto il restore selettivo nella modalità stdin.
+Con più volumi, omettere `--bundle` è un errore. Vengono ripristinati i volumi
+indicati che il bundle contiene; se uno di essi manca, il restore fallisce
+(`--allow-missing` per avvisare e proseguire) e i volumi del bundle non
+richiesti restano intatti.
 
 `--stdout` non gestisce retry, retention, lista dei backup o atomicità del
 backend remoto. Per trasferimenti critici, lo script può caricare un nome
@@ -330,9 +348,15 @@ docker dvol --destination /home/ubuntu/stack_odoo restore pg_data \
 docker dvol --destination /home/ubuntu/stack_odoo restore pg_data
 ```
 
-Il lock temporaneo dell’indice è `.dvol-index.lock`. Gli archivi flat già
-pubblicati vengono recuperati anche se il processo si interrompe durante
-l’aggiornamento dei metadati.
+Il lock temporaneo dell’indice è `.dvol-index.lock` e ogni backup in corso
+mantiene una prenotazione `.dvol-reserve-<archivio>.lock`. Il lock dell’indice
+non viene mai tenuto per tutta la scrittura dell’archivio, quindi `docker dvol
+backups` risponde anche durante un backup lungo; la prenotazione impedisce a due
+processi di scrivere lo stesso nome e permette di distinguere un backup vivo da
+uno interrotto. Gli archivi flat già pubblicati vengono recuperati anche se il
+processo si interrompe durante l’aggiornamento dei metadati, e una voce di
+indice illeggibile viene scartata con un avviso senza bloccare né l’elenco né i
+backup successivi.
 
 I permessi predefiniti restano invariati: file archivio e metadati `0644`,
 directory create `0755`; owner e gruppo sono quelli dell’utente effettivo che
@@ -345,16 +369,87 @@ docker dvol restore app
 docker dvol restore app db
 ```
 
+Con più nomi vengono ripristinati tutti i volumi indicati. Un volume che non
+esiste più viene ricreato: è il caso tipico del disaster recovery.
+
 Ripristinare un archivio preciso o un glob relativo a `backups/app/`:
 
 ```bash
 docker dvol restore app app-20260807-120000.tar.gz
 docker dvol restore app '*.tar.gz'
+docker dvol restore --archive ~/dumps/app-20260807.tar.zst app
+```
+
+L’ultimo argomento viene interpretato come selettore di backup solo se ne ha la
+forma: suffisso `.tar.gz|.tar.xz|.tar.zst|.tar.lz4`, presenza di `/` oppure di
+caratteri glob (`*`, `?`, `[`). Altrimenti è un nome di volume. Con `--archive`
+la scelta è esplicita e non dipende da euristiche.
+
+Opzioni di `restore`:
+
+```text
+--archive <path|glob>   archivio da ripristinare (un solo volume)
+--bundle                ripristina un bundle multi-volume
+--stdin [--spool]       legge l’archivio da stdin
+--allow-missing         con --bundle, avvisa invece di fallire se un volume
+                        richiesto non è nel bundle
+--force                 esegue il restore anche se container in esecuzione
+                        montano il volume
 ```
 
 Il restore estrae prima in uno staging sullo stesso filesystem, valida
 l’archivio e poi sostituisce il contenuto con uno swap atomico. Un archivio
 invalido lascia intatto il volume esistente.
+
+### Volumi in uso
+
+Sostituire la directory di un volume montato da un container in esecuzione non
+è coerente: il container continua a usare la vecchia directory, che il restore
+rimuove, e non vede mai i dati ripristinati. Per questo il restore viene
+rifiutato:
+
+```text
+docker dvol: volume "app" is mounted by running container(s) app-1: a restore
+replaces the directory they hold open, so they would keep writing to the old
+data. Stop them first, or pass --force
+```
+
+Fermare i container, oppure usare `--force` accettandone le conseguenze.
+
+### Archivi singoli e bundle non sono intercambiabili
+
+Un bundle multi-volume passato al restore di un singolo volume viene rifiutato,
+e viceversa:
+
+```bash
+docker dvol restore app backups/compose/demo-20260807.tar.gz
+# docker dvol: archive is a multi-volume dvol bundle: restore it with --bundle
+```
+
+Senza questo controllo il volume verrebbe sostituito dal contenuto del bundle
+(`manifest.json` più una directory per volume).
+
+## Verifica degli archivi
+
+`verify` legge l’archivio per intero — header tar, payload e trailer di
+compressione — senza scrivere nulla. È il modo sicuro per sapere che un backup
+è leggibile prima di averne bisogno:
+
+```bash
+docker dvol verify app                     # tutti gli archivi del volume
+docker dvol verify app app-20260807.tar.gz # un archivio preciso
+docker dvol verify --archive /dumps/x.tar.zst
+docker dvol verify --json app
+```
+
+Output tipico:
+
+```text
+OK /home/u/.local/share/docker-volume-backup/backups/app/app-20260807-120000.tar.gz: volume, 128 entries, 12.4 MiB, 3 symlinks, 1 hardlinks
+```
+
+Un archivio danneggiato viene segnalato con `FAIL` e il comando esce con
+stato 1.
 
 ### Restore da stdin
 
@@ -390,9 +485,10 @@ rclone cat myremote:/dumps/odoo/odoo-volumes.tar.zst \
   | docker dvol restore --stdin --bundle pg_data filestore_data
 ```
 
-Il bundle viene ripristinato interamente: i nomi indicati devono corrispondere
-a tutti i volumi dichiarati nel manifest. Un input troncato o corrotto lascia
-invariati tutti i volumi target.
+I nomi indicati devono essere presenti nel manifest del bundle, altrimenti il
+restore fallisce prima di toccare qualsiasi volume; con `--allow-missing`
+l’assenza diventa un avviso. Un input troncato o corrotto lascia invariati tutti
+i volumi target.
 
 ## Docker Compose
 
@@ -424,9 +520,30 @@ docker dvol compose-backup -f compose.yaml
 Comandi:
 
 ```text
-compose-backup [-f <file>] [-p <project>] [--stdout] [--compression <formato>] [--level <n>] [--threads <n>]
-compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [<archivio>]
+compose-backup [-f <file>] [-p <project>] [--stdout] [--compression <formato>]
+               [--level <n>] [--threads <n>] [--archive-name <nome>]
+               [--timestamp] [--timestamp-utc] [--overwrite] [--skip-missing]
+compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [--strict]
+                [--force] [<archivio>]
 ```
+
+Se un volume dichiarato nel compose file non esiste in Docker, `compose-backup`
+si ferma: un bundle che contiene solo una parte del progetto è indistinguibile
+da uno completo e il problema emergerebbe soltanto durante il restore.
+
+```text
+docker dvol: volume(s) demo_cache declared in compose.yaml do not exist in
+Docker; create them or pass --skip-missing to back up only the existing ones
+```
+
+Con `--skip-missing` il backup prosegue e i volumi esclusi vengono elencati su
+stderr.
+
+Simmetricamente, `compose-restore` accetta per default un bundle che non
+contiene tutti i volumi dichiarati: ripristina quelli presenti e avvisa sugli
+altri, che restano intatti. Con `--strict` un bundle incompleto è un errore. In
+entrambi i casi i volumi Docker mancanti vengono creati **solo dopo** che il
+manifest è stato letto e accettato: un restore rifiutato non lascia volumi vuoti.
 
 Il bundle viene scritto in `backups/compose/`, contiene `manifest.json` e una
 directory per ogni volume. Durante il restore i volumi mancanti vengono creati
@@ -437,6 +554,11 @@ docker dvol compose-restore -f compose.yaml
 docker dvol compose-restore -f compose.yaml \
   ~/.local/share/docker-volume-backup/backups/compose/demo-20260807-120000.tar.gz
 ```
+
+Senza percorso esplicito viene scelto il bundle più recente del progetto. La
+ricerca riconosce sia il nome predefinito `<progetto>-<timestamp>` sia quello
+prodotto da `--timestamp` (`<progetto>_ddmmyyyy_HHMMSS`); un bundle rinominato
+con `--archive-name` viene individuato leggendo il suo `manifest.json`.
 
 Tutti gli staging vengono preparati prima degli swap; ogni volume viene
 sostituito atomicamente e indipendentemente dagli altri.
@@ -465,9 +587,11 @@ rclone cat myremote:/dumps/demo/demo-volumes.tar.zst \
 ```
 
 `compose-restore` richiede il Compose file per determinare i target e il
-progetto per risolvere i nomi. Il manifest deve corrispondere esattamente ai
-volumi del progetto; un mismatch causa errore prima degli swap. Il restore è
-completo, non selettivo. Fermare o quiescere i servizi prima del restore.
+progetto per risolvere i nomi. Il manifest viene confrontato con i volumi del
+progetto prima di qualunque swap e prima di creare volumi Docker: per default un
+volume dichiarato ma assente dal bundle produce un avviso e resta intatto, con
+`--strict` è un errore. Fermare o quiescere i servizi prima del restore, oppure
+usare `--force`.
 
 ## Consistenza e interruzioni
 
@@ -493,11 +617,43 @@ docker dvol compose-backup -f compose.yaml
 
 Il progetto non usa snapshot filesystem automatiche.
 
+### Backup a caldo
+
+Un file che cambia dimensione mentre viene letto non interrompe il backup. La
+dimensione registrata nell’header è quella vista all’apertura del file: se il
+file cresce la coda viene ignorata, se si riduce l’entry viene completata con
+zeri. In entrambi i casi l’archivio resta valido e ripristinabile, e il file
+interessato viene segnalato:
+
+```text
+[WARN] file changed while it was archived; stored the size seen at open time path="/var/lib/docker/volumes/app/_data/wal.log" size=33554432
+[WARN] backup completed with source anomalies changed_files=2 skipped_entries=1
+```
+
+Un socket unix trovato nella sorgente viene saltato con un avviso: non è
+rappresentabile in un archivio tar e non contiene stato. FIFO, device e
+attributi estesi vengono invece archiviati e ripristinati.
+
+### Cosa viene preservato
+
+Il round trip riproduce contenuto, permessi (inclusi setuid/setgid/sticky),
+proprietario e gruppo, mtime al nanosecondo, symlink, **gruppi** di hard link,
+FIFO, attributi estesi (quindi ACL POSIX e capabilities dei file) e i buchi dei
+file sparsi. Gli header sono sempre in formato PAX: il formato USTAR
+tronterebbe i timestamp al secondo.
+
+Limiti noti: `archive/tar` non sa scrivere estensioni sparse, quindi l’archivio
+di un file sparso è grande quanto la sua dimensione apparente (i buchi vengono
+ricreati durante il restore); il ripristino di proprietario, device e attributi
+`security.*`/`system.*` richiede i privilegi corrispondenti, e in loro assenza
+viene emesso un avviso senza interrompere il restore.
+
 In caso di crash durante il backup:
 
 - il volume sorgente non viene modificato;
 - un archivio temporaneo incompleto non viene pubblicato;
-- gli archivi già pubblicati restano validi.
+- gli archivi già pubblicati restano validi;
+- il file temporaneo abbandonato viene rimosso al backup successivo.
 
 La destinazione dell’archivio deve essere esterna a tutti i volumi sorgente.
 Questo comando viene rifiutato prima di creare file:
@@ -519,8 +675,16 @@ necessario allo swap atomico. Un bundle viene pubblicato solo dopo la
 validazione completa di tutti i volumi.
 
 In caso di crash durante il restore, staging e rollback usano percorsi privati
-collision-free; le sostituzioni interrotte vengono recuperate all’avvio
-successivo quando possibile.
+collision-free e ogni sostituzione è registrata in un journal sotto
+`<root>/state/replacements`. All’avvio successivo dvol ripara le operazioni
+interrotte: se la nuova directory era già stata pubblicata rimuove la copia
+vecchia, altrimenti rimette al suo posto quella precedente, e in ogni caso
+elimina lo staging rimasto. Il journal copre qualunque destinazione, compresi i
+mountpoint Docker fuori dal repository, e i record ancora in uso da un altro
+processo vengono saltati: due comandi dvol contemporanei non si disturbano.
+
+Il risultato è che il dato non può sparire: dopo un restore interrotto il volume
+contiene o il contenuto precedente o quello ripristinato, mai nulla.
 
 ## Permessi
 
@@ -532,19 +696,46 @@ repository degli archivi accessibile allo stesso account:
 sudo docker dvol --root /srv/docker-volume-backups backup app
 ```
 
+La lettura usa `O_NOATIME`, che il kernel concede solo al proprietario del file
+o a chi ha `CAP_FOWNER`, e che alcuni filesystem di rete rifiutano. In quel caso
+il backup si ferma:
+
+```text
+docker dvol: source cannot be read without updating access times (operation not
+permitted); pass --allow-atime to accept access-time updates on the source
+```
+
+`--allow-atime` prosegue aggiornando gli atime della sorgente, con un avviso per
+ogni entry interessata. È l’unico modo in cui un backup può modificare qualcosa
+nel volume, e va richiesto esplicitamente.
+
+Gli archivi vengono creati `0644`. Per backup che contengono dati sensibili:
+
+```bash
+docker dvol --archive-mode 0600 backup app
+```
+
 ## Sviluppo e test
 
 ```bash
 cd /percorso/del/repository/docker-volume-plugin
 make build
+make check                 # go vet + go test + go test -race + build
 make test
+make test-race
 make lint
 make e2e
 sudo make acceptance
+sudo make acceptance-defects
 sudo make acceptance-mongo
 make acceptance-stream
 make clean
 ```
+
+`make check` è il gate da superare prima di ogni commit; `sudo make acceptance`
+prima di ogni modifica che tocchi backup, restore o il contratto della CLI.
+Architettura, invarianti e regole per i test sono in `AGENTS.md`; l’audit da cui
+derivano è in `REVIEW.md`.
 
 Il target va eseguito dalla directory root del repository, non da
 `test/acceptance/`. In alternativa, da una sottodirectory usare
@@ -584,12 +775,23 @@ modalità. La matrice è basata sui file
 `test/acceptance/script-start.mongo.sh`; il dettaglio è in
 `test/acceptance/mongo_test_matrix.md`.
 
+`make acceptance-defects` esegue uno scenario per ciascun difetto emerso
+dall’audit: bundle passato al restore singolo, backup a caldo sotto scrittura
+continua, FIFO e socket nel volume, restore di più volumi dopo la cancellazione
+di uno, ricerca del bundle Compose con `--timestamp` e con `--archive-name`,
+disallineamento fra volumi dichiarati e archiviati, restore su volume montato,
+restore interrotto e riparato, fedeltà completa dei metadati e `verify`.
+
 I test unitari coprono backup read-only con verifica di contenuto, ownership,
-permessi, mtime, atime, symlink e hardlink; destinazioni non sicure, errori di
-writer, stream troncati e processo terminato durante il publish; restore
-atomico, rollback, compressione, bundle Compose, interruzioni e gestione di
-mountpoint Docker. `make acceptance-stream` ripete inoltre le verifiche di
-invariabilità sui volumi Docker reali durante backup singoli, bundle e Compose.
+permessi, mtime al nanosecondo, atime, symlink, hardlink, FIFO, attributi estesi
+e file sparsi; destinazioni non sicure, errori di writer, stream troncati e
+processo terminato durante il publish; restore atomico, rollback, journal di
+recupero, compressione, bundle Compose, interruzioni e gestione di mountpoint
+Docker. La suite di concorrenza (`make test-race`) esercita backup simultanei
+sullo stesso nome di archivio, listing durante un backup in corso, restore
+paralleli e recupero concorrente. `make acceptance-stream` ripete inoltre le
+verifiche di invariabilità sui volumi Docker reali durante backup singoli,
+bundle e Compose.
 
 ## Layout
 

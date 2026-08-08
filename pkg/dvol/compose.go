@@ -86,7 +86,11 @@ var projectCharRe = regexp.MustCompile(`[^a-z0-9_.-]+`)
 func normalizeProject(p string) string {
 	p = strings.ToLower(p)
 	p = projectCharRe.ReplaceAllString(p, "-")
-	if p == "" || p == "." || p == "/" {
+	// docker compose requires a project name to start with a letter or a digit.
+	// Keeping a leading "." or "-" here would also produce a hidden bundle file
+	// named after the project.
+	p = strings.TrimLeft(p, ".-_")
+	if p == "" {
 		p = "default"
 	}
 	return p

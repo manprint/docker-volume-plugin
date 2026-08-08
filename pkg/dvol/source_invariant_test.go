@@ -65,7 +65,7 @@ func snapshotTree(t *testing.T, root string) map[string]treeNode {
 	if err := add(".", rootInfo, nil, ""); err != nil {
 		t.Fatalf("snapshot %s: %v", root, err)
 	}
-	err = walkReadOnly(root, func(entry readOnlyTreeEntry) error {
+	err = walkReadOnly(root, readOptions{}, func(entry readOnlyTreeEntry) error {
 		return add(entry.rel, entry.info, entry.file, entry.link)
 	})
 	if err != nil {
@@ -248,7 +248,7 @@ func TestReadOnlyOpenRejectsEntryReplacement(t *testing.T) {
 	if err := os.Symlink(outside, path); err != nil {
 		t.Fatal(err)
 	}
-	if file, _, err := openReadOnlyAt(parent, "data", expected); err == nil {
+	if file, _, err := openReadOnlyAt(parent, "data", expected, readOptions{}); err == nil {
 		_ = file.Close()
 		t.Fatal("replaced source entry was opened")
 	}

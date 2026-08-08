@@ -552,14 +552,27 @@ func TestBackupPreservesSpecialModeBits(t *testing.T) {
 	}
 }
 
-func TestTimestampCollision(t *testing.T) {
-	a, b := ts(), ts()
-	if a == b {
-		// still hard to force a same-instant call;
-		// at most flag so the assertion is meaningful
-		t.Logf("same-nanosecond ts() (%q==%q)", a, b)
+// TestTimestampUniqueness pins the property archive names rely on: two backups
+// taken in the same second must not produce the same file name.
+func TestTimestampUniqueness(t *testing.T) {
+	const samples = 2000
+	seen := make(map[string]bool, samples)
+	for i := 0; i < samples; i++ {
+		stamp := ts()
+		if seen[stamp] {
+			t.Fatalf("ts() repeated %q within %d calls", stamp, samples)
+		}
+		seen[stamp] = true
 	}
-	if !strings.Contains(a, ".") {
-		t.Fatalf("ts() lacks sub-second precision: %q", a)
+	stamp := ts()
+	dot := strings.IndexByte(stamp, '.')
+	if dot < 0 {
+		t.Fatalf("ts() lacks sub-second precision: %q", stamp)
+	}
+	if got := len(stamp) - dot - 1; got != 9 {
+		t.Fatalf("ts() has %d fractional digits, want 9: %q", got, stamp)
+	}
+	if !isArchiveName("vol-" + stamp + ".tar.gz") {
+		t.Fatalf("a name built from ts() is not recognised as an archive: %q", stamp)
 	}
 }

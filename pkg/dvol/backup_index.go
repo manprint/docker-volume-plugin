@@ -16,8 +16,9 @@ import (
 const flatBackupIndexVersion = 1
 
 const (
-	flatBackupIndexName = ".dvol-index.json"
-	flatBackupLockName  = ".dvol-index.lock"
+	flatBackupIndexName   = ".dvol-index.json"
+	flatBackupLockName    = ".dvol-index.lock"
+	flatReservationPrefix = ".dvol-reserve-"
 )
 
 // flatBackupIndex records the logical volume for archives stored directly in
@@ -44,6 +45,16 @@ func (s *Store) flatLockPath() string {
 	return filepath.Join(s.backupsDir(), flatBackupLockName)
 }
 
+func (s *Store) flatReservationPath(name string) string {
+	return filepath.Join(s.backupsDir(), flatReservationPrefix+name+".lock")
+}
+
+// loadFlatIndex reads the index and repairs it in memory.
+//
+// A backup tool must never let damaged metadata stop the operator from taking a
+// new backup: a single unusable entry is dropped with a warning instead of
+// failing the whole index. Only a structurally undecodable file or a version
+// this build cannot rewrite is fatal.
 func (s *Store) loadFlatIndex() (flatBackupIndex, bool, error) {
 	b, err := os.ReadFile(s.flatIndexPath())
 	if os.IsNotExist(err) {
@@ -65,12 +76,21 @@ func (s *Store) loadFlatIndex() (flatBackupIndex, bool, error) {
 	kept := idx.Entries[:0]
 	for _, entry := range idx.Entries {
 		if err := checkName(entry.Volume); err != nil || !isArchiveFileName(entry.Name) || seen[entry.Name] {
-			return flatBackupIndex{}, false, fmt.Errorf("invalid flat backup metadata entry %q", entry.Name)
+			s.logger().Warn("dropping invalid flat backup metadata entry",
+				LogField{Key: "volume", Value: entry.Volume}, LogField{Key: "archive", Value: entry.Name})
+			changed = true
+			continue
 		}
-		seen[entry.Name] = true
 		path := filepath.Join(s.backupsDir(), entry.Name)
 		info, statErr := os.Stat(path)
 		if os.IsNotExist(statErr) {
+			if entry.Pending && s.reservationHeld(entry.Name) {
+				// Another process is writing this archive right now: keep the
+				// reservation so a concurrent backup cannot take the name.
+				seen[entry.Name] = true
+				kept = append(kept, entry)
+				continue
+			}
 			// A pending entry without its archive is a crash before publish;
 			// a completed entry without its archive was removed externally.
 			changed = true
@@ -80,7 +100,10 @@ func (s *Store) loadFlatIndex() (flatBackupIndex, bool, error) {
 			return flatBackupIndex{}, false, statErr
 		}
 		if !info.Mode().IsRegular() {
-			return flatBackupIndex{}, false, fmt.Errorf("flat backup %q is not a regular file", entry.Name)
+			s.logger().Warn("dropping flat backup metadata entry: not a regular file",
+				LogField{Key: "archive", Value: entry.Name})
+			changed = true
+			continue
 		}
 		if entry.Pending {
 			// The archive publication is atomic. If it exists, the pending
@@ -88,12 +111,62 @@ func (s *Store) loadFlatIndex() (flatBackupIndex, bool, error) {
 			entry.Pending = false
 			changed = true
 		}
+		seen[entry.Name] = true
 		kept = append(kept, entry)
 	}
 	idx.Entries = kept
 	return idx, changed, nil
 }
 
+// reservationHeld reports whether another process is actively writing the
+// archive. The reservation file is exclusively flocked for the whole write, so
+// a lock we can take is by definition abandoned.
+func (s *Store) reservationHeld(name string) bool {
+	f, err := os.OpenFile(s.flatReservationPath(name), os.O_RDWR, 0o644)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return true
+	}
+	_ = unix.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
+}
+
+// flatReservation is an exclusive claim on one archive name.
+type flatReservation struct {
+	path string
+	file *os.File
+}
+
+func (s *Store) reserveFlatArchive(name string) (*flatReservation, error) {
+	if err := os.MkdirAll(s.backupsDir(), 0o755); err != nil {
+		return nil, err
+	}
+	path := s.flatReservationPath(name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("a backup of archive %q is already in progress", name)
+	}
+	return &flatReservation{path: path, file: f}, nil
+}
+
+func (r *flatReservation) release() {
+	if r == nil {
+		return
+	}
+	_ = os.Remove(r.path)
+	_ = r.file.Close()
+}
+
+// withFlatIndexLock runs fn under the index lock and persists the result. The
+// critical section is deliberately short: it never spans an archive write, so
+// listing backups is not blocked for the duration of a multi-hour backup.
 func (s *Store) withFlatIndexLock(fn func(*flatBackupIndex) error) error {
 	if err := os.MkdirAll(s.backupsDir(), 0o755); err != nil {
 		return err
@@ -144,8 +217,7 @@ func (s *Store) readFlatIndex() (flatBackupIndex, error) {
 			return result, err
 		}
 	}
-	result = idx
-	return result, err
+	return idx, nil
 }
 
 func (s *Store) flatBackupInfos(volume string) ([]BackupInfo, error) {
@@ -155,7 +227,7 @@ func (s *Store) flatBackupInfos(volume string) ([]BackupInfo, error) {
 	}
 	infos := make([]BackupInfo, 0)
 	for _, entry := range idx.Entries {
-		if entry.Volume != volume {
+		if entry.Volume != volume || entry.Pending {
 			continue
 		}
 		path := filepath.Join(s.backupsDir(), entry.Name)
@@ -186,7 +258,7 @@ func (s *Store) flatBackupMatches(volume, pattern string) ([]string, error) {
 	}
 	matches := make([]string, 0)
 	for _, entry := range idx.Entries {
-		if entry.Volume != volume {
+		if entry.Volume != volume || entry.Pending {
 			continue
 		}
 		matched, err := filepath.Match(pattern, entry.Name)
@@ -201,6 +273,9 @@ func (s *Store) flatBackupMatches(volume, pattern string) ([]string, error) {
 }
 
 func (s *Store) writeFlatIndex(idx flatBackupIndex) error {
+	if idx.Version == 0 {
+		idx.Version = flatBackupIndexVersion
+	}
 	b, err := json.MarshalIndent(idx, "", "  ")
 	if err != nil {
 		return err
@@ -214,7 +289,7 @@ func (s *Store) writeFlatIndex(idx flatBackupIndex) error {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 	}
-	if err := f.Chmod(0o644); err != nil {
+	if err := f.Chmod(s.cfg.archiveMode()); err != nil {
 		cleanup()
 		return err
 	}
@@ -237,33 +312,30 @@ func (s *Store) writeFlatIndex(idx flatBackupIndex) error {
 	return syncDir(s.backupsDir())
 }
 
-// writeFlatBackup serializes reservation, archive publication and metadata
-// completion under one lock. This prevents another backup from mistaking a
-// live pending reservation for a stale crash entry.
-func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, populate func(*tar.Writer) error) error {
-	return s.writeFlatBackupWithProgress(volume, name, path, opts, nil, populate)
-}
-
+// writeFlatBackupWithProgress reserves the archive name, writes the archive
+// outside the index lock and then marks the reservation complete.
 func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error) error {
-	return s.withFlatIndexLock(func(idx *flatBackupIndex) error {
-		previous := append([]flatBackupIndexEntry(nil), idx.Entries...)
-		if opts.Overwrite {
-			filtered := idx.Entries[:0]
-			for _, entry := range idx.Entries {
-				if entry.Name != name {
-					filtered = append(filtered, entry)
-				}
-			}
-			idx.Entries = filtered
-		}
+	reservation, err := s.reserveFlatArchive(name)
+	if err != nil {
+		return err
+	}
+	defer reservation.release()
+
+	if err := s.withFlatIndexLock(func(idx *flatBackupIndex) error {
+		filtered := idx.Entries[:0]
 		for _, entry := range idx.Entries {
 			if entry.Name == name {
-				return fmt.Errorf("backup archive %q already exists", name)
+				if !opts.Overwrite {
+					return fmt.Errorf("%w: %s (use --overwrite to replace it)", ErrArchiveExists, name)
+				}
+				continue
 			}
+			filtered = append(filtered, entry)
 		}
+		idx.Entries = filtered
 		if _, err := os.Lstat(path); err == nil {
 			if !opts.Overwrite {
-				return fmt.Errorf("backup archive %q already exists", name)
+				return fmt.Errorf("%w: %s (use --overwrite to replace it)", ErrArchiveExists, name)
 			}
 		} else if !os.IsNotExist(err) {
 			return err
@@ -274,22 +346,43 @@ func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts Back
 			CreatedAt: time.Now().UTC(),
 			Pending:   true,
 		})
-		if err := s.writeFlatIndex(*idx); err != nil {
-			idx.Entries = previous
-			return err
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// The archive is written without holding the index lock.
+	if writeErr := writeArchiveWithProgress(path, s.cfg.archiveMode(), opts, progress, populate); writeErr != nil {
+		_ = s.withFlatIndexLock(func(idx *flatBackupIndex) error {
+			filtered := idx.Entries[:0]
+			for _, entry := range idx.Entries {
+				if entry.Name != name {
+					filtered = append(filtered, entry)
+				}
+			}
+			idx.Entries = filtered
+			return nil
+		})
+		return writeErr
+	}
+
+	return s.withFlatIndexLock(func(idx *flatBackupIndex) error {
+		for i := range idx.Entries {
+			if idx.Entries[i].Name == name {
+				idx.Entries[i].Pending = false
+				return nil
+			}
 		}
-		if err := writeArchiveWithProgress(path, opts, progress, populate); err != nil {
-			idx.Entries = previous
-			_ = s.writeFlatIndex(*idx)
-			return err
-		}
-		idx.Entries[len(idx.Entries)-1].Pending = false
+		idx.Entries = append(idx.Entries, flatBackupIndexEntry{
+			Volume:    volume,
+			Name:      name,
+			CreatedAt: time.Now().UTC(),
+		})
 		return nil
 	})
 }
 
 func isArchiveFileName(name string) bool {
-	return filepath.Base(name) == name &&
-		(strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tar.xz") ||
-			strings.HasSuffix(name, ".tar.zst") || strings.HasSuffix(name, ".tar.lz4"))
+	return filepath.Base(name) == name && name != "" && !strings.HasPrefix(name, ".") &&
+		isArchiveName(name)
 }

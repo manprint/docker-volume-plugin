@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -27,16 +26,15 @@ func NewStore(cfg Config) (*Store, error) {
 		cfg.Root = DefaultRoot
 	}
 	s := &Store{cfg: cfg}
-	// Do not create the archive destination during store initialization. The
-	// CLI may receive a destination that is inside a Docker volume source; the
-	// backup path validates that relationship before creating any destination
-	// directory. Archive/index operations create backupsDir lazily.
-	for _, d := range []string{cfg.Root, s.volumesDir(), s.metaDir()} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, fmt.Errorf("mkdir %s: %w", d, err)
-		}
+	// Only the repository root is created eagerly. The archive destination may
+	// be a directory inside a Docker volume source; the backup path validates
+	// that relationship before creating any destination directory. The
+	// store-managed volume directories are created on demand by Create, so a
+	// pure archive client does not get empty volumes/ and meta/ trees.
+	if err := os.MkdirAll(cfg.Root, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", cfg.Root, err)
 	}
-	if err := s.recoverInterruptedReplacements(); err != nil {
+	if err := s.recoverReplacements(); err != nil {
 		return nil, fmt.Errorf("recover interrupted volume replacement: %w", err)
 	}
 	return s, nil
@@ -59,68 +57,11 @@ func (s *Store) VolumePath(name string) string { return filepath.Join(s.volumesD
 
 func (s *Store) metaPath(name string) string { return filepath.Join(s.metaDir(), name+".json") }
 
-// recoverInterruptedReplacements repairs the only non-atomic window in a
-// directory swap: a process can die after the old target is renamed aside but
-// before the staged target is renamed into place. Rollback directories are
-// private and include the target name so they can be recovered on startup.
-func (s *Store) recoverInterruptedReplacements() error {
-	metaEntries, err := os.ReadDir(s.metaDir())
-	if err != nil {
-		return err
-	}
-	volumeEntries, err := os.ReadDir(s.volumesDir())
-	if err != nil {
-		return err
-	}
-	changed := false
-	for _, metaEntry := range metaEntries {
-		if metaEntry.IsDir() || !strings.HasSuffix(metaEntry.Name(), ".json") {
-			continue
+func (s *Store) ensureVolumeDirs() error {
+	for _, d := range []string{s.volumesDir(), s.metaDir()} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
-		name := strings.TrimSuffix(metaEntry.Name(), ".json")
-		if checkName(name) != nil {
-			continue
-		}
-		prefix := "." + name + ".dvol-old-"
-		var rollback []string
-		for _, volumeEntry := range volumeEntries {
-			if strings.HasPrefix(volumeEntry.Name(), prefix) {
-				if !volumeEntry.IsDir() {
-					return fmt.Errorf("rollback path %q is not a directory", volumeEntry.Name())
-				}
-				rollback = append(rollback, filepath.Join(s.volumesDir(), volumeEntry.Name()))
-			}
-		}
-		if len(rollback) == 0 {
-			continue
-		}
-		if len(rollback) > 1 {
-			return fmt.Errorf("multiple interrupted replacements for volume %q", name)
-		}
-
-		target := s.VolumePath(name)
-		_, targetErr := os.Lstat(target)
-		switch {
-		case targetErr == nil:
-			// The new target was published before the crash; only cleanup was
-			// interrupted, so discard the old copy.
-			if err := os.RemoveAll(rollback[0]); err != nil {
-				return err
-			}
-			changed = true
-		case os.IsNotExist(targetErr):
-			// The first rename completed but the publish did not. Restore the
-			// old target so the volume name is present again.
-			if err := os.Rename(rollback[0], target); err != nil {
-				return err
-			}
-			changed = true
-		default:
-			return targetErr
-		}
-	}
-	if changed {
-		return syncDir(s.volumesDir())
 	}
 	return nil
 }
@@ -132,10 +73,44 @@ func checkName(name string) error {
 	return nil
 }
 
+// checkArchiveStem validates a caller-supplied archive name stem or bundle
+// prefix. It must be a plain file name component: anything that could escape
+// the destination directory is rejected before a path is built from it.
+func checkArchiveStem(stem string) error {
+	if stem == "" {
+		return fmt.Errorf("empty archive name")
+	}
+	if stem == "." || stem == ".." || filepath.Base(stem) != stem ||
+		containsAny(stem, `/\:`) {
+		return fmt.Errorf("invalid archive name %q (use a file name, not a path)", stem)
+	}
+	// A leading dot would hide the archive and could collide with the control
+	// files dvol keeps in the destination (.dvol-index.json, .dvol-reserve-*,
+	// .dvol-backup-*).
+	if stem[0] == '.' {
+		return fmt.Errorf("invalid archive name %q (must not start with a dot)", stem)
+	}
+	return nil
+}
+
+func containsAny(s, chars string) bool {
+	for _, c := range chars {
+		for _, r := range s {
+			if r == c {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Create makes a new volume. An empty directory is created on disk and the
 // metadata is persisted.
 func (s *Store) Create(name string, opts map[string]string) error {
 	if err := checkName(name); err != nil {
+		return err
+	}
+	if err := s.ensureVolumeDirs(); err != nil {
 		return err
 	}
 	if _, err := os.Stat(s.metaPath(name)); err == nil {
@@ -189,6 +164,9 @@ func (s *Store) Size(name string) int64 {
 func (s *Store) List() ([]*Volume, error) {
 	entries, err := os.ReadDir(s.metaDir())
 	if err != nil {
+		if os.IsNotExist(err) {
+			return []*Volume{}, nil
+		}
 		return nil, err
 	}
 	vols := make([]*Volume, 0, len(entries))

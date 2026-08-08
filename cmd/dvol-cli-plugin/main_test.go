@@ -23,6 +23,11 @@ func newCLIStore(t *testing.T) *dvol.Store {
 type fakeDockerVolumes struct {
 	volumes           map[string]dockerVolumeInfo
 	createMountpoints map[string]string
+	inUse             map[string][]string
+}
+
+func (f *fakeDockerVolumes) ContainersUsing(name string) ([]string, error) {
+	return f.inUse[name], nil
 }
 
 func dockerForStore(store *dvol.Store, names ...string) *fakeDockerVolumes {
@@ -86,7 +91,7 @@ func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mountpoint, "changed.txt"), []byte("must disappear"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.restoreVolume("legacy", archive); err != nil {
+	if err := a.restoreVolume("legacy", archive, false); err != nil {
 		t.Fatalf("restoreVolume: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(mountpoint, "legacy.txt"))
@@ -131,7 +136,7 @@ func TestRestoreCreatesMissingDockerVolume(t *testing.T) {
 		createMountpoints: map[string]string{"new-local": mountpoint},
 	}
 	a := &app{store: store, docker: fake}
-	if err := a.restoreVolume("new-local", archive); err != nil {
+	if err := a.restoreVolume("new-local", archive, false); err != nil {
 		t.Fatalf("restoreVolume: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(mountpoint, "data.txt"))
@@ -305,26 +310,53 @@ func TestCmdBackupMultipleMappingsSameDestination(t *testing.T) {
 }
 
 func TestExtractGlobalFlagsDestination(t *testing.T) {
-	root, destination, level, args := extractGlobalFlags([]string{
+	g := extractGlobalFlags([]string{
 		"backup", "--destination", "/home/ubuntu/dump-mongo-vol", "mongo_data",
 	})
-	if root != "" || destination != "/home/ubuntu/dump-mongo-vol" || level != "" {
-		t.Fatalf("unexpected global flags: root=%q destination=%q log-level=%q", root, destination, level)
+	if g.root != "" || g.backupDir != "/home/ubuntu/dump-mongo-vol" || g.logLevel != "" {
+		t.Fatalf("unexpected global flags: %+v", g)
 	}
-	if got := strings.Join(args, " "); got != "backup mongo_data" {
+	if got := strings.Join(g.rest, " "); got != "backup mongo_data" {
 		t.Fatalf("unexpected remaining args: %q", got)
 	}
 }
 
 func TestExtractGlobalFlagsLogLevel(t *testing.T) {
-	root, destination, level, args := extractGlobalFlags([]string{
-		"backup", "--log-level", "TRACE", "--root=/tmp/dvol", "web",
+	g := extractGlobalFlags([]string{
+		"backup", "--log-level", "TRACE", "--root=/tmp/dvol", "--allow-atime", "web",
 	})
-	if root != "/tmp/dvol" || destination != "" || level != "TRACE" {
-		t.Fatalf("unexpected global flags: root=%q destination=%q log-level=%q", root, destination, level)
+	if g.root != "/tmp/dvol" || g.backupDir != "" || g.logLevel != "TRACE" || !g.allowAtime {
+		t.Fatalf("unexpected global flags: %+v", g)
 	}
-	if got := strings.Join(args, " "); got != "backup web" {
+	if got := strings.Join(g.rest, " "); got != "backup web" {
 		t.Fatalf("unexpected remaining args: %q", got)
+	}
+}
+
+// TestExtractGlobalFlagsStopsAtDoubleDash: everything after "--" belongs to the
+// subcommand, so a value that happens to look like a global flag is not stolen.
+func TestExtractGlobalFlagsStopsAtDoubleDash(t *testing.T) {
+	g := extractGlobalFlags([]string{"backup", "--root", "/tmp/dvol", "--", "--root", "weird-volume"})
+	if g.root != "/tmp/dvol" {
+		t.Fatalf("root not parsed: %+v", g)
+	}
+	if got := strings.Join(g.rest, " "); got != "backup --root weird-volume" {
+		t.Fatalf("unexpected remaining args: %q", got)
+	}
+}
+
+func TestParseArchiveMode(t *testing.T) {
+	mode, err := parseArchiveMode("0600")
+	if err != nil || mode != 0o600 {
+		t.Fatalf("parseArchiveMode(0600) = %v, %v", mode, err)
+	}
+	if mode, err := parseArchiveMode(""); err != nil || mode != 0 {
+		t.Fatalf("empty archive mode should stay unset: %v %v", mode, err)
+	}
+	for _, bad := range []string{"999", "0", "abc", "1777"} {
+		if _, err := parseArchiveMode(bad); err == nil {
+			t.Fatalf("parseArchiveMode(%q) unexpectedly accepted", bad)
+		}
 	}
 }
 

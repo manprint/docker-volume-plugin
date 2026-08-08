@@ -20,6 +20,9 @@ type dockerVolumeClient interface {
 	List() ([]dockerVolumeInfo, error)
 	Inspect(name string) (dockerVolumeInfo, error)
 	Create(name string) (dockerVolumeInfo, error)
+	// ContainersUsing returns the names of the running containers that have the
+	// volume mounted.
+	ContainersUsing(name string) ([]string, error)
 }
 
 // dockerCLI uses the Docker CLI instead of linking the full Engine client.
@@ -71,6 +74,9 @@ func (c *dockerCLI) List() ([]dockerVolumeInfo, error) {
 		}
 		info, err := c.Inspect(name)
 		if err != nil {
+			if errors.Is(err, errDockerVolumeNotFound) {
+				continue // removed between ls and inspect
+			}
 			return nil, err
 		}
 		volumes = append(volumes, info)
@@ -83,4 +89,22 @@ func (c *dockerCLI) Create(name string) (dockerVolumeInfo, error) {
 		return dockerVolumeInfo{}, err
 	}
 	return c.Inspect(name)
+}
+
+// ContainersUsing lists the running containers that mount the volume. Restoring
+// into a mounted volume replaces the directory a container already holds open:
+// the container keeps writing into the detached inode and never sees the
+// restored data, so the CLI refuses unless the operator forces it.
+func (c *dockerCLI) ContainersUsing(name string) ([]string, error) {
+	out, err := c.run("ps", "--filter", "volume="+name, "--format", "{{.Names}}")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			names = append(names, line)
+		}
+	}
+	return names, nil
 }
