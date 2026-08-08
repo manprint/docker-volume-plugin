@@ -65,7 +65,17 @@ func (s *Store) BackupWithOptions(name string, opts BackupOptions) (string, erro
 // BackupSourceWithOptions backs up an arbitrary directory under the logical
 // volume name. It is used by docker dvol for Docker volumes whose driver is
 // not dvol; the directory is normally the volume's Docker mountpoint.
-func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions) (string, error) {
+func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions) (path string, err error) {
+	progress := s.operationProgress("backup")
+	s.logger().Info("backup started", LogField{Key: "volume", Value: name}, LogField{Key: "source", Value: source}, LogField{Key: "compression", Value: opts.norm().Compression})
+	defer func() {
+		if err != nil {
+			s.logger().Error("backup failed", LogField{Key: "volume", Value: name}, LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("backup completed", LogField{Key: "volume", Value: name}, LogField{Key: "archive", Value: path})
+	}()
 	if err := checkName(name); err != nil {
 		return "", err
 	}
@@ -75,26 +85,28 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 	if _, err := validateBackupSource(source); err != nil {
 		return "", err
 	}
+	s.logger().Debug("backup source validated", LogField{Key: "volume", Value: name}, LogField{Key: "source", Value: source})
 	bdir := s.backupDir(name)
 	if opts.SameDestination {
 		bdir = s.backupsDir()
 	}
 	archiveName := archiveFilename(name, opts)
-	path := filepath.Join(bdir, archiveName)
+	path = filepath.Join(bdir, archiveName)
 	if err := ensureBackupDestinationOutsideSources(path, source); err != nil {
 		return "", err
 	}
+	s.logger().Debug("backup destination prepared", LogField{Key: "volume", Value: name}, LogField{Key: "archive", Value: path})
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return "", err
 	}
 	if opts.SameDestination {
-		if err := s.writeFlatBackup(name, archiveName, path, opts, func(tw *tar.Writer) error {
-			return addTreeTo(tw, source, "")
+		if err := s.writeFlatBackupWithProgress(name, archiveName, path, opts, progress, func(tw *tar.Writer) error {
+			return addTreeToWithProgress(tw, source, "", progress)
 		}); err != nil {
 			return "", err
 		}
-	} else if err := writeArchive(path, opts, func(tw *tar.Writer) error {
-		return addTreeTo(tw, source, "")
+	} else if err := writeArchiveWithProgress(path, opts, progress, func(tw *tar.Writer) error {
+		return addTreeToWithProgress(tw, source, "", progress)
 	}); err != nil {
 		return "", err
 	}
@@ -103,7 +115,17 @@ func (s *Store) BackupSourceWithOptions(name, source string, opts BackupOptions)
 
 // BackupSourceToWriter writes a complete single-volume archive to w. It is
 // intentionally stream-only: no archive temporary file is created.
-func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w io.Writer) error {
+func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w io.Writer) (err error) {
+	progress := s.operationProgress("backup stream")
+	s.logger().Info("backup stream started", LogField{Key: "volume", Value: name}, LogField{Key: "compression", Value: opts.norm().Compression})
+	defer func() {
+		if err != nil {
+			s.logger().Error("backup stream failed", LogField{Key: "volume", Value: name}, LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("backup stream completed", LogField{Key: "volume", Value: name})
+	}()
 	if err := checkName(name); err != nil {
 		return err
 	}
@@ -113,8 +135,9 @@ func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w 
 	if _, err := validateBackupSource(source); err != nil {
 		return err
 	}
-	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
-		return addTreeTo(tw, source, "")
+	s.logger().Debug("backup stream source validated", LogField{Key: "volume", Value: name}, LogField{Key: "source", Value: source})
+	return writeArchiveToWithProgress(w, opts, progress, func(tw *tar.Writer) error {
+		return addTreeToWithProgress(tw, source, "", progress)
 	})
 }
 
@@ -154,7 +177,17 @@ func (s *Store) BackupBundleWithOptions(names []string, outDir, prefix string, o
 
 // BackupBundleSourcesWithOptions backs up arbitrary directories as a single
 // bundle. sources maps each logical volume name to its source directory.
-func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[string]string, outDir, prefix string, opts BackupOptions) (string, error) {
+func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[string]string, outDir, prefix string, opts BackupOptions) (path string, err error) {
+	progress := s.operationProgress("backup bundle")
+	s.logger().Info("backup bundle started", LogField{Key: "volumes", Value: strings.Join(names, ",")}, LogField{Key: "compression", Value: opts.norm().Compression})
+	defer func() {
+		if err != nil {
+			s.logger().Error("backup bundle failed", LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("backup bundle completed", LogField{Key: "archive", Value: path})
+	}()
 	if err := opts.Validate(); err != nil {
 		return "", err
 	}
@@ -175,8 +208,9 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 			return "", err
 		}
 	}
+	s.logger().Debug("backup bundle sources validated", LogField{Key: "volumes", Value: strings.Join(clean, ",")})
 
-	path := filepath.Join(outDir, archiveFilename(prefix, opts))
+	path = filepath.Join(outDir, archiveFilename(prefix, opts))
 	for _, name := range clean {
 		if err := ensureBackupDestinationOutsideSources(path, sources[name]); err != nil {
 			return "", err
@@ -185,7 +219,8 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := writeArchive(path, opts, func(tw *tar.Writer) error {
+	s.logger().Debug("backup bundle destination prepared", LogField{Key: "archive", Value: path})
+	if err := writeArchiveWithProgress(path, opts, progress, func(tw *tar.Writer) error {
 		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
 		mb, err := json.Marshal(mf)
 		if err != nil {
@@ -198,7 +233,7 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 			return err
 		}
 		for _, name := range clean {
-			if err := addTreeTo(tw, sources[name], name); err != nil {
+			if err := addTreeToWithProgress(tw, sources[name], name, progress); err != nil {
 				return err
 			}
 		}
@@ -212,7 +247,17 @@ func (s *Store) BackupBundleSourcesWithOptions(names []string, sources map[strin
 // BackupBundleSourcesToWriter writes one multi-volume bundle directly to w.
 // The stream contains manifest.json and one top-level directory per volume;
 // no archive temporary file is created.
-func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]string, opts BackupOptions, w io.Writer) error {
+func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]string, opts BackupOptions, w io.Writer) (err error) {
+	progress := s.operationProgress("backup bundle stream")
+	s.logger().Info("backup bundle stream started", LogField{Key: "volumes", Value: strings.Join(names, ",")}, LogField{Key: "compression", Value: opts.norm().Compression})
+	defer func() {
+		if err != nil {
+			s.logger().Error("backup bundle stream failed", LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("backup bundle stream completed")
+	}()
 	if err := opts.Validate(); err != nil {
 		return err
 	}
@@ -233,7 +278,7 @@ func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]s
 			return err
 		}
 	}
-	return writeArchiveTo(w, opts, func(tw *tar.Writer) error {
+	return writeArchiveToWithProgress(w, opts, progress, func(tw *tar.Writer) error {
 		mf := bundleManifest{Format: bundleFormat, Created: time.Now().UTC(), Volumes: clean}
 		mb, err := json.Marshal(mf)
 		if err != nil {
@@ -246,7 +291,7 @@ func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]s
 			return err
 		}
 		for _, name := range clean {
-			if err := addTreeTo(tw, sources[name], name); err != nil {
+			if err := addTreeToWithProgress(tw, sources[name], name, progress); err != nil {
 				return err
 			}
 		}
@@ -259,6 +304,10 @@ func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]s
 // interrupted write therefore cannot expose a partial archive under its
 // final name or replace an existing valid archive.
 func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) error) error {
+	return writeArchiveWithProgress(path, opts, nil, populate)
+}
+
+func writeArchiveWithProgress(path string, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".dvol-backup-*")
 	if err != nil {
 		return err
@@ -273,7 +322,7 @@ func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) er
 		return err
 	}
 
-	if err := writeArchiveTo(f, opts, populate); err != nil {
+	if err := writeArchiveToWithProgress(f, opts, progress, populate); err != nil {
 		cleanup()
 		return err
 	}
@@ -310,6 +359,13 @@ func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) er
 // writeArchiveTo writes one complete tar/compressed stream to w. It never
 // creates an archive temporary file and is therefore suitable for stdout.
 func writeArchiveTo(w io.Writer, opts BackupOptions, populate func(*tar.Writer) error) error {
+	return writeArchiveToWithProgress(w, opts, nil, populate)
+}
+
+func writeArchiveToWithProgress(w io.Writer, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error) error {
+	if progress != nil {
+		w = progressWriter{writer: w, progress: progress}
+	}
 	compressed, err := opts.newWriter(w)
 	if err != nil {
 		return err
@@ -641,6 +697,10 @@ func walkReadOnlyDir(dir *os.File, dirPath, prefix string, visit func(readOnlyTr
 // written once plus TypeLink entries, preserving inode sharing in both the
 // plain and the bundle layout.
 func addTreeTo(tw *tar.Writer, dir, prefix string) error {
+	return addTreeToWithProgress(tw, dir, prefix, nil)
+}
+
+func addTreeToWithProgress(tw *tar.Writer, dir, prefix string, progress *Progress) error {
 	rootInfo, err := validateBackupSource(dir)
 	if err != nil {
 		return err
@@ -659,6 +719,9 @@ func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 		name := entry.rel
 		if prefix != "" {
 			name = prefix + "/" + name
+		}
+		if progress != nil {
+			progress.logger.Trace("backup entry", LogField{Key: "path", Value: name}, LogField{Key: "size", Value: entry.info.Size()})
 		}
 		if entry.info.Mode().IsRegular() {
 			if st, ok := entry.info.Sys().(*syscall.Stat_t); ok && st.Nlink > 1 {
@@ -695,7 +758,11 @@ func addTreeTo(tw *tar.Writer, dir, prefix string) error {
 		if entry.file == nil {
 			return fmt.Errorf("regular source entry %q was not opened read-only", entry.path)
 		}
-		_, err = io.Copy(tw, entry.file)
+		reader := io.Reader(entry.file)
+		if progress != nil {
+			reader = progressReader{reader: entry.file, progress: progress}
+		}
+		_, err = io.Copy(tw, reader)
 		return err
 	})
 }
@@ -762,7 +829,17 @@ func (s *Store) Restore(name, backupPath string) error {
 // RestoreSource replaces an arbitrary Docker volume mountpoint with the
 // contents of a backup archive. Unlike Restore, it does not create dvol
 // metadata; the Docker Engine already owns the volume metadata.
-func (s *Store) RestoreSource(name, target, backupPath string) error {
+func (s *Store) RestoreSource(name, target, backupPath string) (err error) {
+	progress := s.operationProgress("restore")
+	s.logger().Info("restore started", LogField{Key: "volume", Value: name}, LogField{Key: "archive", Value: backupPath}, LogField{Key: "target", Value: target})
+	defer func() {
+		if err != nil {
+			s.logger().Error("restore failed", LogField{Key: "volume", Value: name}, LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("restore completed", LogField{Key: "volume", Value: name}, LogField{Key: "target", Value: target})
+	}()
 	if err := checkName(name); err != nil {
 		return err
 	}
@@ -779,8 +856,9 @@ func (s *Store) RestoreSource(name, target, backupPath string) error {
 		return err
 	}
 	defer os.RemoveAll(staging)
+	s.logger().Debug("restore staging created", LogField{Key: "volume", Value: name}, LogField{Key: "staging", Value: staging})
 	n := 0
-	if err := extractTarTo(staging, backupPath, func(name string) (string, bool, error) {
+	if err := extractTarToWithProgress(staging, backupPath, progress, func(name string) (string, bool, error) {
 		n++
 		return name, true, nil
 	}); err != nil {
@@ -795,7 +873,17 @@ func (s *Store) RestoreSource(name, target, backupPath string) error {
 // RestoreSourceReader is the stream equivalent of RestoreSource. The input is
 // decompressed and extracted directly into staging; no archive spool file is
 // created. The live target is changed only after a complete valid stream.
-func (s *Store) RestoreSourceReader(name, target string, input io.Reader) error {
+func (s *Store) RestoreSourceReader(name, target string, input io.Reader) (err error) {
+	progress := s.operationProgress("restore stream")
+	s.logger().Info("restore stream started", LogField{Key: "volume", Value: name}, LogField{Key: "target", Value: target})
+	defer func() {
+		if err != nil {
+			s.logger().Error("restore stream failed", LogField{Key: "volume", Value: name}, LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("restore stream completed", LogField{Key: "volume", Value: name})
+	}()
 	if err := checkName(name); err != nil {
 		return err
 	}
@@ -809,13 +897,16 @@ func (s *Store) RestoreSourceReader(name, target string, input io.Reader) error 
 		return err
 	}
 	defer os.RemoveAll(staging)
+	s.logger().Debug("restore stream staging created", LogField{Key: "volume", Value: name}, LogField{Key: "staging", Value: staging})
 	n := 0
-	tr, r, err := openArchiveReader(input)
+	trackedInput := progressReader{reader: input, progress: progress, stream: true}
+	tr, r, err := openArchiveReader(trackedInput)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	if err := extractTarReader(tr, func(entry *tar.Header) (string, string, bool, error) {
+	s.logger().Debug("restore stream decoder opened", LogField{Key: "volume", Value: name})
+	if err := extractTarReaderWithProgress(tr, progress, func(entry *tar.Header) (string, string, bool, error) {
 		n++
 		return entry.Name, staging, true, nil
 	}); err != nil {
@@ -834,7 +925,17 @@ func (s *Store) RestoreSourceReader(name, target string, input io.Reader) error 
 // are restored (all of them if names is empty). Each volume is replaced. The
 // whole archive is extracted to a staging directory first, so a corrupt
 // archive leaves every volume untouched.
-func (s *Store) RestoreBundle(path string, names []string) error {
+func (s *Store) RestoreBundle(path string, names []string) (err error) {
+	progress := s.operationProgress("restore bundle")
+	s.logger().Info("restore bundle started", LogField{Key: "archive", Value: path}, LogField{Key: "volumes", Value: strings.Join(names, ",")})
+	defer func() {
+		if err != nil {
+			s.logger().Error("restore bundle failed", LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("restore bundle completed")
+	}()
 	want := map[string]bool{}
 	for _, n := range names {
 		want[n] = true
@@ -845,7 +946,7 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 	}
 	defer os.RemoveAll(staging)
 
-	if err := extractTarTo(staging, path, func(name string) (string, bool, error) {
+	if err := extractTarToWithProgress(staging, path, progress, func(name string) (string, bool, error) {
 		if name == "manifest.json" {
 			return "", false, nil
 		}
@@ -871,6 +972,7 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("bundle contains no volumes matching the request")
 	}
+	s.logger().Debug("restore bundle staged", LogField{Key: "volumes", Value: len(entries)}, LogField{Key: "staging", Value: staging})
 	// Validate every staged volume root BEFORE touching any live volume: a
 	// single malformed volume (e.g. root swapped into a symlink by a hostile
 	// archive) must not leave the already-staged volumes partially restored.
@@ -901,7 +1003,17 @@ func (s *Store) RestoreBundle(path string, names []string) error {
 // mountpoints. Each target gets a staging directory on its own filesystem so
 // the final rename also works when Docker volumes and the dvol backup store
 // are on different filesystems.
-func (s *Store) RestoreBundleSources(path string, targets map[string]string) error {
+func (s *Store) RestoreBundleSources(path string, targets map[string]string) (err error) {
+	progress := s.operationProgress("restore bundle")
+	s.logger().Info("restore bundle started", LogField{Key: "archive", Value: path}, LogField{Key: "volumes", Value: len(targets)})
+	defer func() {
+		if err != nil {
+			s.logger().Error("restore bundle failed", LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("restore bundle completed")
+	}()
 	if len(targets) == 0 {
 		return fmt.Errorf("no volume targets supplied")
 	}
@@ -941,8 +1053,9 @@ func (s *Store) RestoreBundleSources(path string, targets map[string]string) err
 		if err != nil {
 			return err
 		}
+		s.logger().Debug("restore bundle volume staging created", LogField{Key: "volume", Value: name}, LogField{Key: "staging", Value: stage})
 		count := 0
-		err = extractTarTo(stage, path, func(entry string) (string, bool, error) {
+		err = extractTarToWithProgress(stage, path, progress, func(entry string) (string, bool, error) {
 			if entry == "manifest.json" {
 				return "", false, nil
 			}
@@ -988,6 +1101,7 @@ func (s *Store) RestoreBundleSources(path string, targets map[string]string) err
 		}
 		staged = append(staged, stagedVolume{name: name, staging: root, cleanup: stage, target: target})
 	}
+	s.logger().Debug("restore bundle staged", LogField{Key: "volumes", Value: len(staged)})
 
 	for _, v := range staged {
 		if err := replaceStage(v.staging, v.target); err != nil {
@@ -1001,7 +1115,17 @@ func (s *Store) RestoreBundleSources(path string, targets map[string]string) err
 // stream. It stages each volume beside its Docker mountpoint so it works even
 // when volumes are on different filesystems, while consuming the compressed
 // archive exactly once and without an archive spool file.
-func (s *Store) RestoreBundleSourcesReader(input io.Reader, targets map[string]string) error {
+func (s *Store) RestoreBundleSourcesReader(input io.Reader, targets map[string]string) (err error) {
+	progress := s.operationProgress("restore bundle stream")
+	s.logger().Info("restore bundle stream started", LogField{Key: "volumes", Value: len(targets)})
+	defer func() {
+		if err != nil {
+			s.logger().Error("restore bundle stream failed", LogField{Key: "error", Value: err})
+			return
+		}
+		progress.Complete()
+		s.logger().Info("restore bundle stream completed")
+	}()
 	if len(targets) == 0 {
 		return fmt.Errorf("no volume targets supplied")
 	}
@@ -1045,14 +1169,16 @@ func (s *Store) RestoreBundleSourcesReader(input io.Reader, targets map[string]s
 		}
 	}
 
-	tr, r, err := openArchiveReader(input)
+	trackedInput := progressReader{reader: input, progress: progress, stream: true}
+	tr, r, err := openArchiveReader(trackedInput)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
+	s.logger().Debug("restore bundle stream decoder opened", LogField{Key: "volumes", Value: len(targets)})
 	var manifest bundleManifest
 	manifestSeen := false
-	if err := extractTarReader(tr, func(entry *tar.Header) (string, string, bool, error) {
+	if err := extractTarReaderWithProgress(tr, progress, func(entry *tar.Header) (string, string, bool, error) {
 		if entry.Name == "manifest.json" {
 			data, err := io.ReadAll(tr)
 			if err != nil {
@@ -1162,13 +1288,17 @@ func replaceStage(staging, target string) error {
 // an entry name to the relative target path inside dir; ok=false skips the
 // entry, err aborts the extraction.
 func extractTarTo(dir, path string, filter func(name string) (rel string, ok bool, err error)) error {
-	tr, r, f, err := openArchive(path)
+	return extractTarToWithProgress(dir, path, nil, filter)
+}
+
+func extractTarToWithProgress(dir, path string, progress *Progress, filter func(name string) (rel string, ok bool, err error)) error {
+	tr, r, f, err := openArchiveWithProgress(path, progress)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	defer r.Close()
-	if err := extractTarReader(tr, func(hdr *tar.Header) (string, string, bool, error) {
+	if err := extractTarReaderWithProgress(tr, progress, func(hdr *tar.Header) (string, string, bool, error) {
 		rel, ok, err := filter(hdr.Name)
 		return rel, dir, ok, err
 	}); err != nil {
@@ -1196,6 +1326,10 @@ func finishArchiveReader(r io.ReadCloser) error {
 // also applies metadata only after EOF, which is essential for stream restore
 // atomicity and for directory timestamps.
 func extractTarReader(tr *tar.Reader, route func(*tar.Header) (rel, base string, ok bool, err error)) error {
+	return extractTarReaderWithProgress(tr, nil, route)
+}
+
+func extractTarReaderWithProgress(tr *tar.Reader, progress *Progress, route func(*tar.Header) (rel, base string, ok bool, err error)) error {
 	var metas []fileMeta
 	for {
 		hdr, err := tr.Next()
@@ -1209,6 +1343,9 @@ func extractTarReader(tr *tar.Reader, route func(*tar.Header) (rel, base string,
 		if err != nil {
 			return err
 		}
+		if progress != nil {
+			progress.logger.Trace("restore entry", LogField{Key: "path", Value: hdr.Name}, LogField{Key: "size", Value: hdr.Size})
+		}
 		if !ok {
 			continue
 		}
@@ -1216,7 +1353,7 @@ func extractTarReader(tr *tar.Reader, route func(*tar.Header) (rel, base string,
 		if err != nil {
 			return err
 		}
-		if err := extractEntry(hdr, tr, target, base); err != nil {
+		if err := extractEntryWithProgress(hdr, tr, target, base, progress); err != nil {
 			return err
 		}
 		metas = append(metas, fileMeta{
@@ -1322,6 +1459,10 @@ func (s *Store) ensureVolume(name string) error {
 // extractEntry materializes a single archive entry at target. base is the
 // volume dir, used to resolve hard links.
 func extractEntry(hdr *tar.Header, tr *tar.Reader, target, base string) error {
+	return extractEntryWithProgress(hdr, tr, target, base, nil)
+}
+
+func extractEntryWithProgress(hdr *tar.Header, tr *tar.Reader, target, base string, progress *Progress) error {
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		if err := checkNoSymlinkAncestors(base, target); err != nil {
@@ -1341,7 +1482,11 @@ func extractEntry(hdr *tar.Header, tr *tar.Reader, target, base string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(of, tr); err != nil {
+		reader := io.Reader(tr)
+		if progress != nil {
+			reader = progressReader{reader: tr, progress: progress}
+		}
+		if _, err := io.Copy(of, reader); err != nil {
 			of.Close()
 			return err
 		}

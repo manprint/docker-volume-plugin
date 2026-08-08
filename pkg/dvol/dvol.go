@@ -23,6 +23,10 @@ type Config struct {
 	// BackupsDir is where archives are stored. Empty keeps them under
 	// <Root>/backups. Useful to push backups to a dedicated directory.
 	BackupsDir string
+	// Logger receives operation, diagnostic and progress messages. It is
+	// optional; nil keeps the library silent for embedders that do not need
+	// diagnostics.
+	Logger *Logger
 }
 
 // Volume is a named volume and its metadata.

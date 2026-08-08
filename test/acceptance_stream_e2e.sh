@@ -104,7 +104,15 @@ run_single_matrix() {
   object="/remote/single/$volume.tar.$ext"
   echo "stream single backup/restore compression=$compression"
   before="$(volume_fingerprint "$volume")"
-  dvol_cmd backup --stdout --compression "$compression" --threads 1 "$volume" | rclone_cmd rcat "$object"
+  if [[ "$compression" == gzip ]]; then
+    local archive_stream="$WORK_DIR/$volume.tar.$ext" log_file="$WORK_DIR/$volume.log"
+    dvol_cmd --log-level TRACE backup --stdout --compression "$compression" --threads 1 "$volume" >"$archive_stream" 2>"$log_file"
+    rclone_cmd rcat "$object" <"$archive_stream"
+    grep -F '[TRACE] backup entry' "$log_file" >/dev/null || fail "TRACE backup entry log missing"
+    grep -F 'backup stream progress' "$log_file" >/dev/null || fail "backup progress log missing"
+  else
+    dvol_cmd backup --stdout --compression "$compression" --threads 1 "$volume" | rclone_cmd rcat "$object"
+  fi
   assert_volume_unchanged "$volume" "$before"
   assert_remote_object "$object"
   if [[ "$compression" == gzip ]]; then
@@ -119,7 +127,14 @@ run_single_matrix() {
     assert_volume_unchanged "$volume" "$before"
   fi
   docker run --rm -v "$volume:/data" alpine:3.20 sh -ec "printf '%s\n' changed > /data/data.txt; touch /data/temporary.txt"
-  rclone_cmd cat "$object" | dvol_cmd restore --stdin "$volume"
+  if [[ "$compression" == gzip ]]; then
+    local restore_log="$WORK_DIR/$volume-restore.log"
+    rclone_cmd cat "$object" | dvol_cmd --log-level DEBUG restore --stdin "$volume" 2>"$restore_log"
+    grep -F 'restore stream progress' "$restore_log" >/dev/null || fail "restore progress log missing"
+    grep -F 'restore stream completed' "$restore_log" >/dev/null || fail "restore completion log missing"
+  else
+    rclone_cmd cat "$object" | dvol_cmd restore --stdin "$volume"
+  fi
   assert_volume "$volume" "$marker"
   docker run --rm -v "$volume:/data" alpine:3.20 test ! -e /data/temporary.txt
   docker run --rm -v "$volume:/data" alpine:3.20 sh -ec "printf '%s\n' changed-again > /data/data.txt; touch /data/temporary.txt"
@@ -130,10 +145,11 @@ run_single_matrix() {
   set +e
   # Cut inside the compressed payload (rather than only its optional frame
   # trailer, which some decoders can treat as an otherwise complete tar).
-  rclone_cmd cat "$object" | head -c 64 | dvol_cmd restore --stdin "$volume" >/dev/null 2>&1
+  rclone_cmd cat "$object" | head -c 64 | dvol_cmd restore --stdin "$volume" >/dev/null 2>"$WORK_DIR/$volume-truncated.log"
   status=$?
   set -e
   (( status != 0 )) || fail "truncated stream unexpectedly restored: $compression"
+  grep -F 'restore stream failed' "$WORK_DIR/$volume-truncated.log" >/dev/null || fail "truncated restore error log missing"
   docker run --rm -v "$volume:/data" alpine:3.20 sh -ec 'test "$(cat /data/data.txt)" = preserved'
 }
 

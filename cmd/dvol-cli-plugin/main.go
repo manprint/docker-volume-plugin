@@ -29,6 +29,8 @@ const (
 	metadataCmd   = "docker-cli-plugin-metadata"
 )
 
+var cliLogger = dvol.NewLogger(os.Stderr, dvol.LevelInfo)
+
 type app struct {
 	store          *dvol.Store
 	docker         dockerVolumeClient
@@ -55,11 +57,20 @@ func main() {
 	}
 
 	destinationSet := hasGlobalDestination(args)
-	root, backupDir, args := extractGlobalFlags(args)
+	root, backupDir, logLevelValue, args := extractGlobalFlags(args)
+	logLevel := dvol.LevelInfo
+	var err error
+	if logLevelValue != "" {
+		logLevel, err = dvol.ParseLogLevel(logLevelValue)
+		if err != nil {
+			fail(err)
+		}
+	}
+	cliLogger = dvol.NewLogger(os.Stderr, logLevel)
 	if root == "" {
 		root = defaultBackupRoot()
 	}
-	store, err := dvol.NewStore(dvol.Config{Root: root, BackupsDir: backupDir})
+	store, err := dvol.NewStore(dvol.Config{Root: root, BackupsDir: backupDir, Logger: cliLogger})
 	if err != nil {
 		fail(err)
 	}
@@ -103,7 +114,7 @@ func printMetadata() {
 }
 
 // extractGlobalFlags pulls --root and the backup destination flags out of args.
-func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
+func extractGlobalFlags(args []string) (root, backupDir, logLevel string, out []string) {
 	out = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -129,11 +140,18 @@ func extractGlobalFlags(args []string) (root, backupDir string, out []string) {
 			}
 		case strings.HasPrefix(a, "--destination="):
 			backupDir = strings.TrimPrefix(a, "--destination=")
+		case a == "--log-level":
+			if i+1 < len(args) {
+				logLevel = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(a, "--log-level="):
+			logLevel = strings.TrimPrefix(a, "--log-level=")
 		default:
 			out = append(out, a)
 		}
 	}
-	return root, backupDir, out
+	return root, backupDir, logLevel, out
 }
 
 func hasGlobalDestination(args []string) bool {
@@ -619,6 +637,7 @@ Usage:
 
 Global flags: --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)
             --destination <dir>  backup destination (default <root>/backups; --backup-dir is an alias)
+            --log-level <level>  TRACE, DEBUG, INFO (default), WARN or ERROR
 
 `)
 }
@@ -768,6 +787,7 @@ func humanSize(n int64) string {
 }
 
 func fail(v any) {
+	cliLogger.Error("command failed", dvol.LogField{Key: "error", Value: v})
 	fmt.Fprintln(os.Stderr, "docker dvol:", v)
 	os.Exit(1)
 }

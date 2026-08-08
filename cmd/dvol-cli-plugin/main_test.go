@@ -305,13 +305,25 @@ func TestCmdBackupMultipleMappingsSameDestination(t *testing.T) {
 }
 
 func TestExtractGlobalFlagsDestination(t *testing.T) {
-	root, destination, args := extractGlobalFlags([]string{
+	root, destination, level, args := extractGlobalFlags([]string{
 		"backup", "--destination", "/home/ubuntu/dump-mongo-vol", "mongo_data",
 	})
-	if root != "" || destination != "/home/ubuntu/dump-mongo-vol" {
-		t.Fatalf("unexpected global flags: root=%q destination=%q", root, destination)
+	if root != "" || destination != "/home/ubuntu/dump-mongo-vol" || level != "" {
+		t.Fatalf("unexpected global flags: root=%q destination=%q log-level=%q", root, destination, level)
 	}
 	if got := strings.Join(args, " "); got != "backup mongo_data" {
+		t.Fatalf("unexpected remaining args: %q", got)
+	}
+}
+
+func TestExtractGlobalFlagsLogLevel(t *testing.T) {
+	root, destination, level, args := extractGlobalFlags([]string{
+		"backup", "--log-level", "TRACE", "--root=/tmp/dvol", "web",
+	})
+	if root != "/tmp/dvol" || destination != "" || level != "TRACE" {
+		t.Fatalf("unexpected global flags: root=%q destination=%q log-level=%q", root, destination, level)
+	}
+	if got := strings.Join(args, " "); got != "backup web" {
 		t.Fatalf("unexpected remaining args: %q", got)
 	}
 }

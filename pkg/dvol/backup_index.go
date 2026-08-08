@@ -241,6 +241,10 @@ func (s *Store) writeFlatIndex(idx flatBackupIndex) error {
 // completion under one lock. This prevents another backup from mistaking a
 // live pending reservation for a stale crash entry.
 func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, populate func(*tar.Writer) error) error {
+	return s.writeFlatBackupWithProgress(volume, name, path, opts, nil, populate)
+}
+
+func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error) error {
 	return s.withFlatIndexLock(func(idx *flatBackupIndex) error {
 		previous := append([]flatBackupIndexEntry(nil), idx.Entries...)
 		if opts.Overwrite {
@@ -274,7 +278,7 @@ func (s *Store) writeFlatBackup(volume, name, path string, opts BackupOptions, p
 			idx.Entries = previous
 			return err
 		}
-		if err := writeArchive(path, opts, populate); err != nil {
+		if err := writeArchiveWithProgress(path, opts, progress, populate); err != nil {
 			idx.Entries = previous
 			_ = s.writeFlatIndex(*idx)
 			return err

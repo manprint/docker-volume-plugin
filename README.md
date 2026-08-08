@@ -162,6 +162,38 @@ Opzioni di `backup`:
                               diagnostica su stderr; default: false
 ```
 
+## Logging e avanzamento
+
+Il livello si configura globalmente con `--log-level`:
+
+```text
+--log-level TRACE|DEBUG|INFO|WARN|ERROR    default: INFO
+```
+
+I livelli sono cumulativi: `INFO` mostra avvio, completamento, errori e
+avanzamento; `DEBUG` aggiunge staging, validazioni e dettagli operativi;
+`TRACE` aggiunge le singole entry archiviate/estratte; `WARN` mostra solo
+avvisi ed errori; `ERROR` mostra esclusivamente gli errori.
+
+Esempi:
+
+```bash
+docker dvol --log-level DEBUG backup --compression zstd mongo_data
+docker dvol --log-level TRACE restore --stdin mongo_data < backup.tar.zst
+```
+
+Durante backup e restore vengono riportati separatamente i byte di dati
+elaborati e quelli dello stream compresso, con unità dinamiche `B`, `KB`, `MB`,
+`GB` e `TB`, per esempio:
+
+```text
+2026-08-08T05:40:54+02:00 [INFO] backup stream progress data="12.4 MB" stream="3.1 MB"
+```
+
+Tutti i messaggi, inclusi progress ed errori, sono scritti su `stderr`.
+In particolare `--stdout` rimane esclusivamente l’archivio binario e non viene
+mai contaminato dal logging.
+
 Le stesse opzioni `--compression`, `--level` e `--threads` sono disponibili
 anche per `docker dvol compose-backup`.
 

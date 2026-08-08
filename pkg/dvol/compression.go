@@ -233,26 +233,34 @@ func isArchiveName(n string) bool {
 // the file extension. Returns tar reader, decompressor and file; callers must
 // close both the decompressor and the file.
 func openArchive(path string) (*tar.Reader, io.ReadCloser, *os.File, error) {
+	return openArchiveWithProgress(path, nil)
+}
+
+func openArchiveWithProgress(path string, progress *Progress) (*tar.Reader, io.ReadCloser, *os.File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	var r io.ReadCloser
+	input := io.Reader(f)
+	if progress != nil {
+		input = progressReader{reader: f, progress: progress, stream: true}
+	}
 	switch {
 	case strings.HasSuffix(path, ".tar.gz"):
-		g, e := gzip.NewReader(f)
+		g, e := gzip.NewReader(input)
 		if e == nil {
 			r = g
 		}
 		err = e
 	case strings.HasSuffix(path, ".tar.xz"):
-		x, e := xz.NewReader(f)
+		x, e := xz.NewReader(input)
 		if e == nil {
 			r = io.NopCloser(x)
 		}
 		err = e
 	case strings.HasSuffix(path, ".tar.zst"):
-		z, e := zstd.NewReader(f)
+		z, e := zstd.NewReader(input)
 		if e == nil {
 			r = readCloser{
 				Reader: z,
@@ -262,7 +270,7 @@ func openArchive(path string) (*tar.Reader, io.ReadCloser, *os.File, error) {
 		err = e
 	case strings.HasSuffix(path, ".tar.lz4"):
 		r = readCloser{
-			Reader: lz4.NewReader(f),
+			Reader: lz4.NewReader(input),
 			close:  func() error { return nil },
 		}
 	default:
