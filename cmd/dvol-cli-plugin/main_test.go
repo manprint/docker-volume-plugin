@@ -24,9 +24,13 @@ type fakeDockerVolumes struct {
 	volumes           map[string]dockerVolumeInfo
 	createMountpoints map[string]string
 	inUse             map[string][]string
+	inUseErr          error
 }
 
 func (f *fakeDockerVolumes) ContainersUsing(name string) ([]string, error) {
+	if f.inUseErr != nil {
+		return nil, f.inUseErr
+	}
 	return f.inUse[name], nil
 }
 

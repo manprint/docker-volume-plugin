@@ -573,3 +573,40 @@ func TestEmptyVolumeRoundTrip(t *testing.T) {
 		t.Fatalf("target not emptied: %v", entries)
 	}
 }
+
+func TestSymlinkXattrsRoundTripWhenSupported(t *testing.T) {
+	s := newTestStore(t)
+	source := t.TempDir()
+	link := filepath.Join(source, "link")
+	if err := os.Symlink("target", link); err != nil {
+		t.Fatal(err)
+	}
+	const attr = "user.dvol-symlink-test"
+	value := []byte("preserved")
+	if err := unix.Lsetxattr(link, attr, value, 0); err != nil {
+		if xattrsUnsupported(err) {
+			t.Skipf("filesystem does not support symlink xattrs: %v", err)
+		}
+		t.Fatal(err)
+	}
+	archive, err := s.BackupSourceWithOptions("web", source, BackupOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := s.RestoreSource("web", target, archive); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(target, "link")
+	size, err := unix.Lgetxattr(restored, attr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, size)
+	if _, err := unix.Lgetxattr(restored, attr, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("symlink xattr=%q, want %q", got, value)
+	}
+}

@@ -304,3 +304,52 @@ findings:
 4. H1, H2, H3 — CLI-level, all cheap.
 5. H4, H5.
 6. Test suite items 1-5, which lock all of the above.
+
+---
+
+# Follow-up full review — 2026-08-09
+
+The entire repository was reviewed again after the 2026-08-08 remediation. All
+confirmed defects below were fixed and pinned by regression tests.
+
+## Fixed findings
+
+| Severity | Finding | Regression coverage |
+|---|---|---|
+| Blocker | Bundle entries could use a non-canonical path to escape their logical volume; hard links could cross volume boundaries. | `TestBundleEntryCannotTraverseOutsideItsVolumeRoot`, `TestBundleHardLinkCannotCrossVolumeBoundary` |
+| Blocker | An oversized first `manifest.json` could bypass bundle classification and reach a single-volume restore. | `TestOversizedBundleManifestCannotBypassArchiveKindCheck` |
+| High | Two bundle names resolving to the same physical directory could stage and swap the same live target twice. | `TestBundleRestoreRejectsDuplicatePhysicalTargets` |
+| High | New replacement journals inferred commit state from path existence, so a crash after rename but before durable publication could preserve an uncommitted target. | `TestJournalRollsBackRenameNotDurablyPublished` plus the journal crash matrix |
+| High | A crashed flat-index overwrite could lose the previous index entry or attach old metadata to a newly published inode. | `TestFailedFlatOverwriteRestoresPreviousIndexEntry`, `TestFlatOverwriteCrashDistinguishesOldAndPublishedArchive` |
+| High | Docker container-usage lookup failed open, allowing restore while safety state was unknown. It now fails closed unless `--force` is explicit. | `TestRestoreRefusesWhenContainerUsageCannotBeChecked` |
+| High | The previous Go baseline was affected by GO-2026-4869 in `archive/tar`, reachable from archive verification. Minimum Go is now 1.26.2. | `govulncheck ./...` |
+| Medium | `Store.Create` used a check-then-write metadata path and admitted concurrent double creation. Metadata publication is now exclusive, synced and atomic. | `TestConcurrentCreateHasSingleWinner` |
+| Medium | Temporary archives inherited the final public mode while still incomplete. They remain `0600` until validation and publication. | `TestTemporaryArchiveStaysPrivateUntilPublication` |
+| Medium | Archive discovery accepted FIFOs and verification/restore could block opening one. Only regular files are accepted and opens are non-blocking until type validation. | `TestArchiveDiscoveryAndVerifyRejectFIFOs` |
+| Medium | Symlink, FIFO and device xattrs were not archived; concurrent xattr shrink could append zero bytes. | `TestFifoRoundTrip`, `TestSymlinkXattrsRoundTripWhenSupported` |
+| Medium | Device major/minor values could overflow during restore. | `TestRestoreRejectsOverflowingDeviceNumbers` |
+| Medium | Several exported stream APIs panicked on nil endpoints and repository methods accepted invalid names. | `TestNilStreamEndpointsReturnErrorsInsteadOfPanicking`, `TestInvalidName` |
+| Medium | CLI paths silently ignored extra positional arguments, multiple Compose files and duplicate physical volume mappings. | `TestCLIRejectsArgumentsItWouldOtherwiseIgnore`, `TestResolveComposeFileRejectsSilentlyIgnoredOverrides` |
+| Medium | Automatic Compose restore trusted filename prefixes and could choose a newer single-volume decoy. It now validates kind and manifest contents. | `TestLatestBundleFindsTimestampedAndRenamedBundles` |
+| Low | Archive stems accepted glob/control/path metacharacters; archive locks and reservations were unnecessarily public; several cleanup and reporting errors were ignored. | Expanded validation and regression suites |
+
+## Validation
+
+- `make check`: vet, unit/regression/fidelity/concurrency tests, race detector
+  and static build pass.
+- `staticcheck ./...`, filtered `gosec`, `govulncheck ./...`, ShellCheck warning
+  level and shell syntax checks pass.
+- `FuzzExtractTarStream` completed a 30-second run with 334,753 executions and
+  no failure.
+- `sudo make acceptance` passes end to end: defect scenarios, PostgreSQL/Odoo,
+  MongoDB, both client paths and streaming/rclone across all compressions.
+
+## Remaining architectural limits
+
+No further confirmed correctness defect remains open from this review. The
+documented product limits still apply: multi-volume publication is atomic per
+volume rather than transactionally atomic across filesystems; live backup is
+crash-consistent per file rather than a snapshot; sparse extents expand in the
+archive; dvol intentionally has no retention/prune command. Compose YAML merge,
+environment interpolation and profile evaluation are delegated to
+`docker compose config` and are now documented explicitly.

@@ -337,3 +337,35 @@ func TestConcurrentBundleRestoresIndependentTargets(t *testing.T) {
 		}
 	}
 }
+
+func TestConcurrentCreateHasSingleWinner(t *testing.T) {
+	s := newTestStore(t)
+	const workers = 16
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errCh <- s.Create("shared", map[string]string{"worker": fmt.Sprint(i)})
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	winners := 0
+	for err := range errCh {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, ErrExists):
+		default:
+			t.Fatalf("unexpected concurrent Create error: %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent Create winners=%d, want exactly one", winners)
+	}
+	if _, err := s.Get("shared"); err != nil {
+		t.Fatalf("winning metadata is unreadable: %v", err)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/klauspost/pgzip"
 	"github.com/pierrec/lz4/v4"
 	"github.com/ulikunitz/xz"
+	"golang.org/x/sys/unix"
 )
 
 // Compression is the archive compression format.
@@ -251,8 +252,24 @@ func openArchive(path string) (*tar.Reader, io.ReadCloser, *os.File, error) {
 }
 
 func openArchiveWithProgress(path string, progress *Progress) (*tar.Reader, io.ReadCloser, *os.File, error) {
-	f, err := os.Open(path)
+	// O_NONBLOCK prevents a path ending in an archive suffix but referring to a
+	// FIFO from hanging verify/restore before its type can be checked. It has no
+	// effect on regular files and is cleared after validation.
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, nil, nil, fmt.Errorf("archive path %q is not a regular file", path)
+	}
+	if err := unix.SetNonblock(int(f.Fd()), false); err != nil {
+		_ = f.Close()
 		return nil, nil, nil, err
 	}
 	var r io.ReadCloser
@@ -288,11 +305,11 @@ func openArchiveWithProgress(path string, progress *Progress) (*tar.Reader, io.R
 			close:  func() error { return nil },
 		}
 	default:
-		f.Close()
+		_ = f.Close()
 		return nil, nil, nil, fmt.Errorf("unsupported archive format %q (use .tar.gz, .tar.xz, .tar.zst or .tar.lz4)", path)
 	}
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, nil, nil, err
 	}
 	return tar.NewReader(r), r, f, nil

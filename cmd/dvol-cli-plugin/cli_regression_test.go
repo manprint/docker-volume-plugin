@@ -26,6 +26,7 @@ type childSpec struct {
 	Volumes   map[string]string   `json:"volumes"`
 	Creatable map[string]string   `json:"creatable"`
 	InUse     map[string][]string `json:"in_use"`
+	InUseErr  string              `json:"in_use_error"`
 	Command   string              `json:"command"`
 	Args      []string            `json:"args"`
 }
@@ -50,6 +51,9 @@ func TestCLIChild(t *testing.T) {
 		volumes:           map[string]dockerVolumeInfo{},
 		createMountpoints: spec.Creatable,
 		inUse:             spec.InUse,
+	}
+	if spec.InUseErr != "" {
+		fake.inUseErr = fmt.Errorf("%s", spec.InUseErr)
 	}
 	for name, mountpoint := range spec.Volumes {
 		fake.volumes[name] = dockerVolumeInfo{Name: name, Driver: "local", Mountpoint: mountpoint}
@@ -206,9 +210,17 @@ func TestLatestBundleFindsTimestampedAndRenamedBundles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	decoySource, err := store.BackupSourceWithOptions("decoy", source, dvol.BackupOptions{ArchiveName: "decoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(store.BundleDir(), "demo-decoy.tar.gz")
+	if err := os.Rename(decoySource, decoy); err != nil {
+		t.Fatal(err)
+	}
 	got, err := latestBundle(store.BundleDir(), "demo", names)
 	if err != nil || got != stamped {
-		t.Fatalf("timestamped bundle not found: got %q err=%v", got, err)
+		t.Fatalf("timestamped bundle not found past newer prefixed single-volume decoy: got %q err=%v", got, err)
 	}
 
 	// A bundle renamed with --archive-name carries no project prefix: the
@@ -404,6 +416,40 @@ func TestRestoreRefusesVolumeMountedByRunningContainer(t *testing.T) {
 	}
 }
 
+func TestRestoreRefusesWhenContainerUsageCannotBeChecked(t *testing.T) {
+	root := t.TempDir()
+	store, err := dvol.NewStore(dvol.Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := seedCLIVolume(t, store, "web", "archived")
+	if err := os.WriteFile(filepath.Join(mount, "data.txt"), []byte("live"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runChild(t, childSpec{
+		Root: root, Volumes: map[string]string{"web": mount}, InUseErr: "Docker unavailable",
+		Command: "restore", Args: []string{"web"},
+	})
+	if code == 0 || !strings.Contains(stderr, "--force") || !strings.Contains(stderr, "Docker unavailable") {
+		t.Fatalf("an unverifiable idle state must fail closed: code=%d stderr=%s", code, stderr)
+	}
+	if got, err := os.ReadFile(filepath.Join(mount, "data.txt")); err != nil || string(got) != "live" {
+		t.Fatalf("failed-closed restore modified the volume: %q err=%v", got, err)
+	}
+
+	_, stderr, code = runChild(t, childSpec{
+		Root: root, Volumes: map[string]string{"web": mount}, InUseErr: "Docker unavailable",
+		Command: "restore", Args: []string{"--force", "web"},
+	})
+	if code != 0 {
+		t.Fatalf("--force must explicitly override the failed check: %s", stderr)
+	}
+	if got, err := os.ReadFile(filepath.Join(mount, "data.txt")); err != nil || string(got) != "archived" {
+		t.Fatalf("forced restore did not run: %q err=%v", got, err)
+	}
+}
+
 func TestBundleRestoreRefusesVolumeInUse(t *testing.T) {
 	root := t.TempDir()
 	store, err := dvol.NewStore(dvol.Config{Root: root})
@@ -527,5 +573,29 @@ func TestBackupStdoutRejectsIncompatibleFlags(t *testing.T) {
 		if code == 0 {
 			t.Fatalf("%v should have been refused (%s)", args, stderr)
 		}
+	}
+}
+
+func TestCLIRejectsArgumentsItWouldOtherwiseIgnore(t *testing.T) {
+	root := t.TempDir()
+	for _, tc := range []struct {
+		command string
+		args    []string
+	}{
+		{command: "compose-backup", args: []string{"unexpected"}},
+		{command: "compose-restore", args: []string{"one.tar.gz", "two.tar.gz"}},
+		{command: "verify", args: []string{"web", "one.tar.gz", "ignored.tar.gz"}},
+		{command: "verify", args: []string{"--archive", "one.tar.gz", "ignored"}},
+	} {
+		_, stderr, code := runChild(t, childSpec{Root: root, Command: tc.command, Args: tc.args})
+		if code == 0 {
+			t.Fatalf("%s %v silently accepted extra arguments: %s", tc.command, tc.args, stderr)
+		}
+	}
+}
+
+func TestResolveComposeFileRejectsSilentlyIgnoredOverrides(t *testing.T) {
+	if _, err := resolveComposeFile([]string{"compose.yaml", "override.yaml"}); err == nil || !strings.Contains(err.Error(), "multiple -f") {
+		t.Fatalf("multiple compose files must be rejected explicitly, got %v", err)
 	}
 }

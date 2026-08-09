@@ -172,7 +172,7 @@ func TestCustomBackupsDir(t *testing.T) {
 	}
 	// default store still uses <root>/backups
 	s2 := newTestStore(t)
-	if !filepath.HasPrefix(s2.backupsDir(), filepath.Join(s2.cfg.Root, backupsDir)) {
+	if s2.backupsDir() != filepath.Join(s2.cfg.Root, backupsDir) {
 		t.Fatalf("default backups dir wrong: %q", s2.backupsDir())
 	}
 }

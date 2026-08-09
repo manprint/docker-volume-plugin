@@ -30,18 +30,24 @@ import (
 const replacementRecordVersion = 1
 
 type replacementRecord struct {
-	Version int    `json:"version"`
-	Staging string `json:"staging"`
-	Target  string `json:"target,omitempty"`
-	Backup  string `json:"backup,omitempty"`
+	Version   int    `json:"version"`
+	Staging   string `json:"staging"`
+	StageRoot string `json:"stage_root,omitempty"`
+	Target    string `json:"target,omitempty"`
+	Backup    string `json:"backup,omitempty"`
+	// Pointer distinguishes new records explicitly marked uncommitted from
+	// legacy v1 records, whose recovery inferred publication from target
+	// existence.
+	Published *bool `json:"published,omitempty"`
 }
 
 // replacement is an open, exclusively locked journal record.
 type replacement struct {
-	path   string
-	file   *os.File
-	record replacementRecord
-	closed bool
+	path     string
+	file     *os.File
+	record   replacementRecord
+	closed   bool
+	preserve bool
 }
 
 func (s *Store) journalDir() string { return filepath.Join(s.cfg.Root, stateDir, "replacements") }
@@ -63,10 +69,11 @@ func (s *Store) beginStaging(staging string) (*replacement, error) {
 		_ = os.Remove(f.Name())
 		return nil, fmt.Errorf("lock replacement journal: %w", err)
 	}
+	published := false
 	r := &replacement{
 		path:   f.Name(),
 		file:   f,
-		record: replacementRecord{Version: replacementRecordVersion, Staging: staging},
+		record: replacementRecord{Version: replacementRecordVersion, Staging: staging, Published: &published},
 	}
 	if err := r.append(); err != nil {
 		r.discard()
@@ -92,8 +99,19 @@ func (r *replacement) setTarget(target string) error {
 	return r.append()
 }
 
+func (r *replacement) setStageRoot(staging string) error {
+	r.record.StageRoot = staging
+	return r.append()
+}
+
 func (r *replacement) setBackup(backup string) error {
 	r.record.Backup = backup
+	return r.append()
+}
+
+func (r *replacement) setPublished() error {
+	published := true
+	r.record.Published = &published
 	return r.append()
 }
 
@@ -105,7 +123,9 @@ func (r *replacement) discard() {
 		return
 	}
 	r.closed = true
-	_ = os.Remove(r.path)
+	if !r.preserve {
+		_ = os.Remove(r.path)
+	}
 	_ = r.file.Close()
 }
 
@@ -161,7 +181,9 @@ func (s *Store) recoverReplacement(path string) error {
 		LogField{Key: "staging", Value: record.Staging},
 		LogField{Key: "rollback", Value: record.Backup})
 
-	if record.Backup != "" && record.Target != "" {
+	if record.Published == nil && record.Backup != "" && record.Target != "" {
+		// Legacy v1 record: preserve the original existence-based recovery
+		// semantics so upgrades can repair operations started by older dvol.
 		_, targetErr := os.Lstat(record.Target)
 		switch {
 		case targetErr == nil:
@@ -183,6 +205,60 @@ func (s *Store) recoverReplacement(path string) error {
 			}
 		default:
 			return targetErr
+		}
+	} else if record.Published != nil && record.Target != "" {
+		targetInfo, targetErr := os.Lstat(record.Target)
+		targetExists := targetErr == nil
+		if targetErr != nil && !os.IsNotExist(targetErr) {
+			return targetErr
+		}
+		_ = targetInfo
+		backupExists := false
+		if record.Backup != "" {
+			if _, err := os.Lstat(record.Backup); err == nil {
+				backupExists = true
+			} else if !os.IsNotExist(err) {
+				return err
+			}
+		}
+		if *record.Published {
+			if targetExists {
+				if backupExists {
+					if err := os.RemoveAll(record.Backup); err != nil {
+						return err
+					}
+				}
+			} else if backupExists {
+				// A committed replacement was removed after the crash. Recover the
+				// only complete copy still available rather than deleting it.
+				if err := os.Rename(record.Backup, record.Target); err != nil {
+					return err
+				}
+			}
+		} else if backupExists {
+			// Publication was never durably recorded. Roll back even if the new
+			// target rename happened immediately before the crash.
+			if targetExists {
+				if err := os.RemoveAll(record.Target); err != nil {
+					return err
+				}
+			}
+			if err := os.Rename(record.Backup, record.Target); err != nil {
+				return err
+			}
+		} else if targetExists && record.StageRoot != "" {
+			if _, err := os.Lstat(record.StageRoot); os.IsNotExist(err) {
+				// Target did not exist before the operation and the stage root has
+				// moved: remove the uncommitted publication.
+				if err := os.RemoveAll(record.Target); err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			}
+		}
+		if err := syncDir(filepath.Dir(record.Target)); err != nil {
+			return err
 		}
 	}
 	if record.Staging != "" {
@@ -240,6 +316,9 @@ func (s *Store) replaceStage(rec *replacement, staging, target string) error {
 		}
 		defer rec.discard()
 	}
+	if err := rec.setStageRoot(staging); err != nil {
+		return err
+	}
 	if err := rec.setTarget(target); err != nil {
 		return err
 	}
@@ -252,7 +331,21 @@ func (s *Store) replaceStage(rec *replacement, staging, target string) error {
 		if err := os.Rename(staging, target); err != nil {
 			return err
 		}
-		return syncDir(filepath.Dir(target))
+		if err := syncDir(filepath.Dir(target)); err != nil {
+			if rollbackErr := os.Rename(target, staging); rollbackErr != nil {
+				rec.preserve = true
+				return fmt.Errorf("sync published volume: %w (rollback failed: %v)", err, rollbackErr)
+			}
+			return err
+		}
+		if err := rec.setPublished(); err != nil {
+			if rollbackErr := os.Rename(target, staging); rollbackErr != nil {
+				rec.preserve = true
+				return fmt.Errorf("record published volume: %w (rollback failed: %v)", err, rollbackErr)
+			}
+			return err
+		}
+		return nil
 	}
 	// Keep the old target in a private, collision-free path. A fixed suffix
 	// would collide with a valid volume name such as "foo.dvol-old".
@@ -275,8 +368,33 @@ func (s *Store) replaceStage(rec *replacement, staging, target string) error {
 		}
 		return err
 	}
-	if err := os.RemoveAll(backup); err != nil {
-		return err
+	rollback := func(cause error) error {
+		if err := os.Rename(target, staging); err != nil {
+			rec.preserve = true
+			return fmt.Errorf("%w (moving unpublished target aside failed: %v)", cause, err)
+		}
+		if err := os.Rename(backup, target); err != nil {
+			rec.preserve = true
+			return fmt.Errorf("%w (rollback failed: %v)", cause, err)
+		}
+		return cause
 	}
-	return syncDir(filepath.Dir(target))
+	if err := syncDir(filepath.Dir(target)); err != nil {
+		return rollback(err)
+	}
+	if err := rec.setPublished(); err != nil {
+		return rollback(err)
+	}
+	if err := os.RemoveAll(backup); err != nil {
+		rec.preserve = true
+		s.logger().Warn("restored volume but old copy cleanup is deferred",
+			LogField{Key: "target", Value: target}, LogField{Key: "backup", Value: backup}, LogField{Key: "error", Value: err})
+		return nil
+	}
+	if err := syncDir(filepath.Dir(target)); err != nil {
+		rec.preserve = true
+		s.logger().Warn("restored volume but cleanup durability is deferred",
+			LogField{Key: "target", Value: target}, LogField{Key: "error", Value: err})
+	}
+	return nil
 }

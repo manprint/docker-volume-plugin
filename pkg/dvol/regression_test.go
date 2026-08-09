@@ -101,6 +101,27 @@ func TestRestoreStreamRejectsBundleArchiveOnSingleVolume(t *testing.T) {
 	assertTreeUnchanged(t, target, "target after refused bundle stream", before, snapshotTree(t, target))
 }
 
+func TestNilStreamEndpointsReturnErrorsInsteadOfPanicking(t *testing.T) {
+	s := newTestStore(t)
+	source, target := t.TempDir(), t.TempDir()
+	writeVolumeFile(t, source, "data.txt", "x")
+	if err := s.BackupSourceToWriter("web", source, BackupOptions{}, nil); err == nil {
+		t.Fatal("nil single-volume backup writer was accepted")
+	}
+	if err := s.BackupBundleSourcesToWriter([]string{"web"}, map[string]string{"web": source}, BackupOptions{}, nil); err == nil {
+		t.Fatal("nil bundle backup writer was accepted")
+	}
+	if err := s.RestoreSourceReader("web", target, nil); err == nil {
+		t.Fatal("nil single-volume restore reader was accepted")
+	}
+	if err := s.RestoreBundleReader(nil, RestoreOptions{}, StaticTargets(nil)); err == nil {
+		t.Fatal("nil bundle restore reader was accepted")
+	}
+	if err := s.RestoreBundleReader(bytes.NewReader(nil), RestoreOptions{}, nil); err == nil {
+		t.Fatal("nil bundle resolver was accepted")
+	}
+}
+
 func TestRestoreBundleRejectsSingleVolumeArchive(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.Create("web", nil); err != nil {
@@ -120,6 +141,84 @@ func TestRestoreBundleRejectsSingleVolumeArchive(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(target, "live.txt")); err != nil || string(got) != "live" {
 		t.Fatalf("target was modified by the refused restore: %q err=%v", got, err)
 	}
+}
+
+func TestBundleEntryCannotTraverseOutsideItsVolumeRoot(t *testing.T) {
+	s := newTestStore(t)
+	archive := craftBundleTar(t, []string{"app"}, []tarItem{
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "app/../escaped.txt", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("not-app-data")},
+	})
+	target := t.TempDir()
+	writeVolumeFile(t, target, "live.txt", "keep")
+	before := snapshotTree(t, target)
+
+	err := s.RestoreBundleSources(archive, map[string]string{"app": target})
+	if err == nil || !strings.Contains(err.Error(), "malformed bundle entry") {
+		t.Fatalf("bundle traversal must be refused, got %v", err)
+	}
+	assertTreeUnchanged(t, target, "target after bundle traversal", before, snapshotTree(t, target))
+}
+
+func TestBundleHardLinkCannotCrossVolumeBoundary(t *testing.T) {
+	s := newTestStore(t)
+	archive := craftBundleTar(t, []string{"app", "db"}, []tarItem{
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "db/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "db/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("db")},
+		{hdr: tar.Header{Name: "app/data", Typeflag: tar.TypeLink, Linkname: "db/data", Mode: 0o644}},
+	})
+	targets := map[string]string{"app": t.TempDir(), "db": t.TempDir()}
+	for name, target := range targets {
+		writeVolumeFile(t, target, "live.txt", "keep-"+name)
+	}
+
+	err := s.RestoreBundleSources(archive, targets)
+	if err == nil || !strings.Contains(err.Error(), "outside volume") {
+		t.Fatalf("cross-volume hard link must be refused, got %v", err)
+	}
+	for name, target := range targets {
+		if got, readErr := os.ReadFile(filepath.Join(target, "live.txt")); readErr != nil || string(got) != "keep-"+name {
+			t.Fatalf("target %s changed after refused hard link: %q err=%v", name, got, readErr)
+		}
+	}
+}
+
+func TestBundleRestoreRejectsDuplicatePhysicalTargets(t *testing.T) {
+	s := newTestStore(t)
+	archive := craftBundleTar(t, []string{"app", "db"}, []tarItem{
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "app/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("app")},
+		{hdr: tar.Header{Name: "db/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "db/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("db")},
+	})
+	target := t.TempDir()
+	writeVolumeFile(t, target, "live.txt", "keep")
+	before := snapshotTree(t, target)
+
+	err := s.RestoreBundleSources(archive, map[string]string{"app": target, "db": target})
+	if err == nil || !strings.Contains(err.Error(), "same restore target") {
+		t.Fatalf("duplicate physical targets must be refused, got %v", err)
+	}
+	assertTreeUnchanged(t, target, "duplicate restore target", before, snapshotTree(t, target))
+}
+
+func TestOversizedBundleManifestCannotBypassArchiveKindCheck(t *testing.T) {
+	s := newTestStore(t)
+	manifest := []byte(`{"format":"` + bundleFormat + `","volumes":["app"],"padding":"` + strings.Repeat("x", manifestProbeLimit) + `"}`)
+	archive := craftTar(t, []tarItem{
+		{hdr: tar.Header{Name: bundleManifestName, Typeflag: tar.TypeReg, Mode: 0o644}, data: manifest},
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+	})
+	target := t.TempDir()
+	writeVolumeFile(t, target, "live.txt", "keep")
+	before := snapshotTree(t, target)
+
+	err := s.RestoreSource("victim", target, archive)
+	if err == nil || !strings.Contains(err.Error(), "manifest exceeds") {
+		t.Fatalf("oversized bundle manifest must be refused, got %v", err)
+	}
+	assertTreeUnchanged(t, target, "oversized manifest", before, snapshotTree(t, target))
 }
 
 // A volume may legitimately hold its own manifest.json; only dvol's own bundle
@@ -319,8 +418,17 @@ func TestFifoRoundTrip(t *testing.T) {
 	}
 	vdir := s.VolumePath("fifo")
 	writeVolumeFile(t, vdir, "keep.txt", "keep")
-	if err := unix.Mkfifo(filepath.Join(vdir, "run.fifo"), 0o640); err != nil {
+	fifo := filepath.Join(vdir, "run.fifo")
+	if err := unix.Mkfifo(fifo, 0o640); err != nil {
 		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+	xattrValue := []byte("fifo-metadata")
+	xattrPreserved := true
+	if err := unix.Lsetxattr(fifo, "user.dvol-fifo-test", xattrValue, 0); err != nil {
+		if !xattrsUnsupported(err) {
+			t.Fatal(err)
+		}
+		xattrPreserved = false
 	}
 	archive, err := s.Backup("fifo")
 	if err != nil {
@@ -339,6 +447,20 @@ func TestFifoRoundTrip(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o640 {
 		t.Fatalf("FIFO permissions not preserved: %v", fi.Mode().Perm())
+	}
+	if xattrPreserved {
+		restored := filepath.Join(target, "run.fifo")
+		size, err := unix.Lgetxattr(restored, "user.dvol-fifo-test", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, size)
+		if _, err := unix.Lgetxattr(restored, "user.dvol-fifo-test", got); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, xattrValue) {
+			t.Fatalf("FIFO xattr=%q, want %q", got, xattrValue)
+		}
 	}
 	if got, err := os.ReadFile(filepath.Join(target, "keep.txt")); err != nil || string(got) != "keep" {
 		t.Fatalf("sibling data lost: %q err=%v", got, err)
@@ -360,6 +482,23 @@ func TestRestoreSkipsDeviceNodeWithoutPrivileges(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(s.VolumePath("dev"), "keep.txt")); err != nil || string(got) != "keep" {
 		t.Fatalf("regular entry lost: %q err=%v", got, err)
+	}
+}
+
+func TestRestoreRejectsOverflowingDeviceNumbers(t *testing.T) {
+	base := t.TempDir()
+	for _, hdr := range []tar.Header{
+		{Name: "negative", Typeflag: tar.TypeChar, Mode: 0o600, Devmajor: -1, Devminor: 1},
+		{Name: "overflow", Typeflag: tar.TypeBlock, Mode: 0o600, Devmajor: 1, Devminor: 1 << 32},
+	} {
+		target := filepath.Join(base, hdr.Name)
+		_, err := extractEntry(&hdr, bytes.NewReader(nil), target, base, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "invalid device numbers") {
+			t.Fatalf("invalid device header %+v was accepted: %v", hdr, err)
+		}
+		if _, err := os.Lstat(target); !os.IsNotExist(err) {
+			t.Fatalf("invalid device entry was created: %v", err)
+		}
 	}
 }
 
@@ -788,6 +927,29 @@ func TestVerifyArchiveReportsAndDetectsCorruption(t *testing.T) {
 	}
 }
 
+func TestArchiveDiscoveryAndVerifyRejectFIFOs(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "looks-valid.tar.gz")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot create FIFO: %v", err)
+	}
+	infos, err := ListArchives(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("archive discovery included a FIFO: %+v", infos)
+	}
+	s := newTestStore(t)
+	started := time.Now()
+	if _, err := s.VerifyArchive(fifo); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("verify accepted FIFO archive: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("verify blocked on FIFO for %v", elapsed)
+	}
+}
+
 func TestInspectArchiveClassifiesBundles(t *testing.T) {
 	s := newTestStore(t)
 	source := t.TempDir()
@@ -843,12 +1005,43 @@ func TestSweepRemovesAbandonedTempArchiveButNotLiveOnes(t *testing.T) {
 	}
 }
 
+func TestTemporaryArchiveStaysPrivateUntilPublication(t *testing.T) {
+	dir := t.TempDir()
+	final := filepath.Join(dir, "published.tar.gz")
+	err := writeArchiveWithProgress(final, 0o644, BackupOptions{}, nil, func(_ *tar.Writer) error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), tempArchivePrefix) {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if got := info.Mode().Perm(); got != 0o600 {
+				return fmt.Errorf("in-progress archive mode=%#o, want 0600", got)
+			}
+			return nil
+		}
+		return fmt.Errorf("in-progress archive not found")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(final); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("published archive mode: info=%v err=%v", info, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Naming
 // ---------------------------------------------------------------------------
 
 func TestArchiveNameValidation(t *testing.T) {
-	for _, name := range []string{"../evil", "a/b", `a\b`, "a:b", ".", "..", "", ".hidden", ".dvol-index.json"} {
+	for _, name := range []string{"../evil", "a/b", `a\b`, "a:b", "a*b", "a?b", "a[b]", "line\nbreak", ".", "..", "", ".hidden", ".dvol-index.json"} {
 		if err := (BackupOptions{ArchiveName: name}).Validate(); err == nil && name != "" {
 			t.Fatalf("archive name %q was accepted", name)
 		}

@@ -138,6 +138,9 @@ func (s *Store) BackupSourceToWriter(name, source string, opts BackupOptions, w 
 		progress.Complete()
 		s.logger().Info("backup stream completed", LogField{Key: "volume", Value: name})
 	}()
+	if w == nil {
+		return fmt.Errorf("nil backup stream writer")
+	}
 	if err := checkName(name); err != nil {
 		return err
 	}
@@ -266,6 +269,9 @@ func (s *Store) BackupBundleSourcesToWriter(names []string, sources map[string]s
 		progress.Complete()
 		s.logger().Info("backup bundle stream completed")
 	}()
+	if w == nil {
+		return fmt.Errorf("nil backup stream writer")
+	}
 	if err := opts.Validate(); err != nil {
 		return err
 	}
@@ -334,12 +340,14 @@ func writeArchiveWithProgress(path string, mode os.FileMode, opts BackupOptions,
 		_ = f.Close()
 		_ = os.Remove(tmp)
 	}
-	if err := f.Chmod(mode); err != nil {
+	if err := writeArchiveToWithProgress(f, opts, progress, populate); err != nil {
 		cleanup()
 		return err
 	}
-
-	if err := writeArchiveToWithProgress(f, opts, progress, populate); err != nil {
+	// os.CreateTemp starts at 0600. Keep the in-progress archive private even
+	// when the requested published mode is world-readable: a failed backup was
+	// never authorized for publication and may contain sensitive partial data.
+	if err := f.Chmod(mode); err != nil {
 		cleanup()
 		return err
 	}
@@ -448,6 +456,9 @@ func ListArchives(dir string) ([]BackupInfo, error) {
 				continue
 			}
 			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			continue
 		}
 		infos = append(infos, BackupInfo{
 			Name:      e.Name(),
@@ -724,11 +735,12 @@ func restoreSymlinkTimes(fd int, original unix.Stat_t, name string, opts readOpt
 }
 
 type readOnlyTreeEntry struct {
-	path string
-	rel  string
-	info os.FileInfo
-	link string
-	file *os.File
+	path   string
+	rel    string
+	info   os.FileInfo
+	link   string
+	file   *os.File
+	xattrs map[string]string
 }
 
 // walkReadOnly traverses a source using directory descriptors. It never
@@ -783,6 +795,10 @@ func walkReadOnlyDir(dir *os.File, dirPath, prefix string, opts readOptions, vis
 				}
 				return err
 			}
+			entry.xattrs, err = readPathXattrs(path)
+			if err != nil {
+				return fmt.Errorf("read extended attributes of symlink %q: %w", path, err)
+			}
 			if err := visit(entry); err != nil {
 				return err
 			}
@@ -809,6 +825,10 @@ func walkReadOnlyDir(dir *os.File, dirPath, prefix string, opts readOptions, vis
 				return closeErr
 			}
 		default:
+			entry.xattrs, err = readPathXattrs(path)
+			if err != nil {
+				return fmt.Errorf("read extended attributes of special entry %q: %w", path, err)
+			}
 			if err := visit(entry); err != nil {
 				return err
 			}
@@ -901,14 +921,15 @@ func (s *Store) addTree(tw *tar.Writer, dir, prefix string, progress *Progress) 
 		// drops the access time entirely. A restored tree would then differ
 		// from its source by up to a second on every single entry.
 		hdr.Format = tar.FormatPAX
+		attrs := entry.xattrs
 		if entry.file != nil {
-			attrs, err := readXattrs(int(entry.file.Fd()))
+			attrs, err = readXattrs(int(entry.file.Fd()))
 			if err != nil {
 				return fmt.Errorf("read extended attributes of %q: %w", entry.path, err)
 			}
-			if len(attrs) > 0 {
-				hdr.PAXRecords = attrs
-			}
+		}
+		if len(attrs) > 0 {
+			hdr.PAXRecords = attrs
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
@@ -1041,6 +1062,9 @@ func dirHeader(name string, info os.FileInfo, path string, opts readOptions) (*t
 
 // ListBackups returns the backups of a volume sorted by creation time.
 func (s *Store) ListBackups(name string) ([]BackupInfo, error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
 	nested, err := ListArchives(s.backupDir(name))
 	if err != nil {
 		return nil, err
@@ -1067,6 +1091,9 @@ func (s *Store) BundleDir() string {
 // ResolveBackup returns an archive path for a volume backup: arg may be an
 // exact or glob path, or a filename/glob resolved against backups/<vol>/.
 func (s *Store) ResolveBackup(vol, arg string) (string, error) {
+	if err := checkName(vol); err != nil {
+		return "", err
+	}
 	if matches, err := filepath.Glob(arg); err == nil && len(matches) == 1 {
 		return matches[0], nil
 	}

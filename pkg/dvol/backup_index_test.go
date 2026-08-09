@@ -1,6 +1,7 @@
 package dvol
 
 import (
+	"archive/tar"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -265,5 +266,85 @@ func TestFlatBackupIndexSerializesConcurrentBackups(t *testing.T) {
 		if err != nil || len(infos) != 1 {
 			t.Fatalf("concurrent flat backup %q: %+v err=%v", name, infos, err)
 		}
+	}
+}
+
+func TestFailedFlatOverwriteRestoresPreviousIndexEntry(t *testing.T) {
+	s, _ := newFlatStore(t)
+	if err := s.Create("one", nil); err != nil {
+		t.Fatal(err)
+	}
+	path, err := s.BackupWithOptions("one", BackupOptions{ArchiveName: "shared", SameDestination: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := BackupOptions{ArchiveName: "shared", SameDestination: true, Overwrite: true}
+	err = s.writeFlatBackupWithProgress("two", filepath.Base(path), path, opts, nil, func(*tar.Writer) error {
+		return fmt.Errorf("simulated archive failure")
+	})
+	if err == nil {
+		t.Fatal("failed overwrite unexpectedly succeeded")
+	}
+	if infos, err := s.ListBackups("one"); err != nil || len(infos) != 1 || infos[0].Path != path {
+		t.Fatalf("previous flat metadata was lost: %+v err=%v", infos, err)
+	}
+	if infos, err := s.ListBackups("two"); err != nil || len(infos) != 0 {
+		t.Fatalf("failed replacement metadata survived: %+v err=%v", infos, err)
+	}
+	if _, err := s.VerifyArchive(path); err != nil {
+		t.Fatalf("previous archive was not preserved: %v", err)
+	}
+}
+
+func TestFlatOverwriteCrashDistinguishesOldAndPublishedArchive(t *testing.T) {
+	s, destination := newFlatStore(t)
+	archive := "shared.tar.gz"
+	path := filepath.Join(destination, archive)
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, ino, ok := fileIdentity(info)
+	if !ok {
+		t.Skip("filesystem identity unavailable")
+	}
+	oldCreated := time.Now().Add(-time.Hour).UTC()
+	pending := flatBackupIndexEntry{
+		Volume: "new", Name: archive, CreatedAt: time.Now().UTC(), Pending: true,
+		Previous:        &flatBackupPrevious{Volume: "old", Name: archive, CreatedAt: oldCreated},
+		PreviousArchive: true, PreviousDev: dev, PreviousIno: ino,
+	}
+	writeIndex := func(entry flatBackupIndexEntry) {
+		t.Helper()
+		b, err := json.Marshal(flatBackupIndex{Version: flatBackupIndexVersion, Entries: []flatBackupIndexEntry{entry}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(destination, flatBackupIndexName), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeIndex(pending)
+	if infos, err := s.ListBackups("old"); err != nil || len(infos) != 1 {
+		t.Fatalf("crash before overwrite did not restore old metadata: %+v err=%v", infos, err)
+	}
+
+	tmp := filepath.Join(destination, "replacement")
+	if err := os.WriteFile(tmp, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	writeIndex(pending)
+	if infos, err := s.ListBackups("new"); err != nil || len(infos) != 1 {
+		t.Fatalf("crash after overwrite did not commit new metadata: %+v err=%v", infos, err)
+	}
+	if infos, err := s.ListBackups("old"); err != nil || len(infos) != 0 {
+		t.Fatalf("old metadata survived a published overwrite: %+v err=%v", infos, err)
 	}
 }

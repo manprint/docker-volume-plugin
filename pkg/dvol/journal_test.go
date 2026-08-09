@@ -60,6 +60,9 @@ func TestJournalRecoversCrashBeforePublish(t *testing.T) {
 	if err := rec.setTarget(target); err != nil {
 		t.Fatal(err)
 	}
+	if err := rec.setStageRoot(staging); err != nil {
+		t.Fatal(err)
+	}
 	backup := filepath.Join(filepath.Dir(target), "._data.dvol-old-crash")
 	if err := rec.setBackup(backup); err != nil {
 		t.Fatal(err)
@@ -108,7 +111,13 @@ func TestJournalRecoversCrashAfterPublish(t *testing.T) {
 	if err := rec.setTarget(target); err != nil {
 		t.Fatal(err)
 	}
+	if err := rec.setStageRoot(filepath.Join(staging, "published-root")); err != nil {
+		t.Fatal(err)
+	}
 	if err := rec.setBackup(backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.setPublished(); err != nil {
 		t.Fatal(err)
 	}
 	crash(t, rec)
@@ -124,6 +133,59 @@ func TestJournalRecoversCrashAfterPublish(t *testing.T) {
 		if _, err := os.Lstat(leftover); !os.IsNotExist(err) {
 			t.Fatalf("leftover %s remains: %v", leftover, err)
 		}
+	}
+}
+
+func TestJournalRollsBackRenameNotDurablyPublished(t *testing.T) {
+	root := t.TempDir()
+	s, err := NewStore(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := dockerLikeTarget(t, "web")
+	if err := os.WriteFile(filepath.Join(target, "state"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staging, rec, err := s.newStaging(filepath.Dir(target), ".restore-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageRoot := filepath.Join(staging, "root")
+	if err := os.Mkdir(stageRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageRoot, "state"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(filepath.Dir(target), "._data.dvol-old-uncommitted")
+	if err := rec.setStageRoot(stageRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.setTarget(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.setBackup(backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(target, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(stageRoot, target); err != nil {
+		t.Fatal(err)
+	}
+	// Crash before setPublished: target exists, but that is no longer enough
+	// to infer commit because another process could also have recreated it.
+	crash(t, rec)
+
+	if _, err := NewStore(Config{Root: root}); err != nil {
+		t.Fatalf("NewStore recovery: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(target, "state"))
+	if err != nil || string(got) != "old" {
+		t.Fatalf("uncommitted publication was not rolled back: %q err=%v", got, err)
+	}
+	if _, err := os.Lstat(backup); !os.IsNotExist(err) {
+		t.Fatalf("rollback directory remains: %v", err)
 	}
 }
 

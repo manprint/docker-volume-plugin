@@ -59,12 +59,67 @@ func readXattrs(fd int) (map[string]string, error) {
 		}
 		value := make([]byte, valueSize)
 		if valueSize > 0 {
-			if _, err := unix.Fgetxattr(fd, name, value); err != nil {
+			n, err := unix.Fgetxattr(fd, name, value)
+			if err != nil {
 				if xattrsUnsupported(err) {
 					continue
 				}
 				return nil, err
 			}
+			value = value[:n]
+		}
+		records[xattrPAXPrefix+name] = string(value)
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	return records, nil
+}
+
+// readPathXattrs reads attributes without following the final path component.
+// It is used for symlinks and special files, which cannot be opened through the
+// ordinary read-only descriptor path used for regular files and directories.
+func readPathXattrs(path string) (map[string]string, error) {
+	size, err := unix.Llistxattr(path, nil)
+	if err != nil {
+		if xattrsUnsupported(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if size <= 0 {
+		return nil, nil
+	}
+	buf := make([]byte, size)
+	size, err = unix.Llistxattr(path, buf)
+	if err != nil {
+		if xattrsUnsupported(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	records := map[string]string{}
+	for _, name := range strings.Split(string(buf[:size]), "\x00") {
+		if name == "" {
+			continue
+		}
+		valueSize, err := unix.Lgetxattr(path, name, nil)
+		if err != nil {
+			if xattrsUnsupported(err) {
+				continue
+			}
+			return nil, err
+		}
+		value := make([]byte, valueSize)
+		if valueSize > 0 {
+			n, err := unix.Lgetxattr(path, name, value)
+			if err != nil {
+				if xattrsUnsupported(err) {
+					continue
+				}
+				return nil, err
+			}
+			value = value[:n]
 		}
 		records[xattrPAXPrefix+name] = string(value)
 	}

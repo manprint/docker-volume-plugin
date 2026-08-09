@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"time"
+	"unicode"
 )
 
 // nameRe is the volume naming rule. Docker volumes follow
@@ -81,8 +82,13 @@ func checkArchiveStem(stem string) error {
 		return fmt.Errorf("empty archive name")
 	}
 	if stem == "." || stem == ".." || filepath.Base(stem) != stem ||
-		containsAny(stem, `/\:`) {
+		containsAny(stem, `/\:*?[]`) {
 		return fmt.Errorf("invalid archive name %q (use a file name, not a path)", stem)
+	}
+	for _, r := range stem {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("invalid archive name %q (control characters are not allowed)", stem)
+		}
 	}
 	// A leading dot would hide the archive and could collide with the control
 	// files dvol keeps in the destination (.dvol-index.json, .dvol-reserve-*,
@@ -131,12 +137,40 @@ func (s *Store) writeMeta(name string, opts map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.metaPath(name), b, 0o644)
+	path := s.metaPath(name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return ErrExists
+		}
+		return err
+	}
+	committed := false
+	defer func() {
+		_ = f.Close()
+		if !committed {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	committed = true
+	return syncDir(s.metaDir())
 }
 
 // Get returns the volume and its metadata, or ErrNotFound. The Size field is
 // not populated (computing it walks the whole volume); use Size or List.
 func (s *Store) Get(name string) (*Volume, error) {
+	if err := checkName(name); err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(s.metaPath(name))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -157,6 +191,9 @@ func (s *Store) Get(name string) (*Volume, error) {
 
 // Size returns the total size in bytes of the volume data.
 func (s *Store) Size(name string) int64 {
+	if checkName(name) != nil {
+		return 0
+	}
 	return dirSize(s.VolumePath(name))
 }
 
@@ -188,6 +225,9 @@ func (s *Store) List() ([]*Volume, error) {
 
 // Remove deletes the volume directory and its metadata.
 func (s *Store) Remove(name string) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
 	if _, err := os.Stat(s.metaPath(name)); err != nil {
 		if os.IsNotExist(err) {
 			return ErrNotFound
@@ -210,7 +250,7 @@ func nameFromMetaFile(f string) string {
 
 func dirSize(dir string) int64 {
 	var total int64
-	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}

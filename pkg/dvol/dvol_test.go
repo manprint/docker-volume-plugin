@@ -59,6 +59,20 @@ func TestInvalidName(t *testing.T) {
 	if err := s.Create("/abs", nil); err != ErrInvalidName {
 		t.Fatalf("expected ErrInvalidName, got %v", err)
 	}
+	for _, name := range []string{"../evil", "/abs"} {
+		if _, err := s.Get(name); err != ErrInvalidName {
+			t.Fatalf("Get(%q): expected ErrInvalidName, got %v", name, err)
+		}
+		if err := s.Remove(name); err != ErrInvalidName {
+			t.Fatalf("Remove(%q): expected ErrInvalidName, got %v", name, err)
+		}
+		if _, err := s.ListBackups(name); err != ErrInvalidName {
+			t.Fatalf("ListBackups(%q): expected ErrInvalidName, got %v", name, err)
+		}
+		if _, err := s.ResolveBackup(name, "*.tar.gz"); err != ErrInvalidName {
+			t.Fatalf("ResolveBackup(%q): expected ErrInvalidName, got %v", name, err)
+		}
+	}
 }
 
 func TestBackupRestoreRoundTrip(t *testing.T) {

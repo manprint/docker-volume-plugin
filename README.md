@@ -16,7 +16,7 @@ volumi creati prima dell’installazione.
 ## Requisiti
 
 - Docker Engine e il comando `docker` sull’host che esegue il comando;
-- Go 1.26.1 o superiore per compilare il progetto;
+- Go 1.26.2 o superiore per compilare il progetto;
 - permessi di lettura/scrittura sul mountpoint Docker;
 - container fermi o quiescenti durante il backup, se serve una fotografia coerente.
 
@@ -415,6 +415,9 @@ data. Stop them first, or pass --force
 ```
 
 Fermare i container, oppure usare `--force` accettandone le conseguenze.
+Se Docker non riesce a determinare se il volume è in uso, il restore fallisce
+allo stesso modo; `--force` è l’unico opt-in che permette di procedere senza
+questa verifica.
 
 ### Archivi singoli e bundle non sono intercambiabili
 
@@ -527,6 +530,11 @@ compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [--strict]
                 [--force] [<archivio>]
 ```
 
+È accettato un solo `-f`: dvol non implementa le regole di merge di Compose.
+Inoltre legge il YAML letterale e non espande variabili d'ambiente o profili.
+Per più file o configurazioni interpolate, generare prima il risultato con
+`docker compose ... config` e passare quel file a dvol.
+
 Se un volume dichiarato nel compose file non esiste in Docker, `compose-backup`
 si ferma: un bundle che contiene solo una parte del progetto è indistinguibile
 da uno completo e il problema emergerebbe soltanto durante il restore.
@@ -555,7 +563,9 @@ docker dvol compose-restore -f compose.yaml \
   ~/.local/share/docker-volume-backup/backups/compose/demo-20260807-120000.tar.gz
 ```
 
-Senza percorso esplicito viene scelto il bundle più recente del progetto. La
+Senza percorso esplicito viene scelto il bundle valido più recente del progetto;
+un archivio singolo o un bundle con volumi estranei viene ignorato anche se il
+nome inizia con quello del progetto. La
 ricerca riconosce sia il nome predefinito `<progetto>-<timestamp>` sia quello
 prodotto da `--timestamp` (`<progetto>_ddmmyyyy_HHMMSS`); un bundle rinominato
 con `--archive-name` viene individuato leggendo il suo `manifest.json`.

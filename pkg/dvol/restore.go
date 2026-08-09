@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -94,6 +95,9 @@ func (s *Store) RestoreSourceReader(name, target string, input io.Reader) (err e
 		progress.Complete()
 		s.logger().Info("restore stream completed", LogField{Key: "volume", Value: name})
 	}()
+	if input == nil {
+		return fmt.Errorf("nil restore stream reader")
+	}
 	if err := checkName(name); err != nil {
 		return err
 	}
@@ -200,6 +204,9 @@ func (s *Store) RestoreBundleTargets(path string, opts RestoreOptions, resolve V
 		progress.Complete()
 		s.logger().Info("restore bundle completed")
 	}()
+	if resolve == nil {
+		return fmt.Errorf("nil volume target resolver")
+	}
 	tr, closeArchive, err := s.openArchiveForRestore(path, progress)
 	if err != nil {
 		return err
@@ -233,6 +240,12 @@ func (s *Store) RestoreBundleReader(input io.Reader, opts RestoreOptions, resolv
 		progress.Complete()
 		s.logger().Info("restore bundle stream completed")
 	}()
+	if input == nil {
+		return fmt.Errorf("nil restore stream reader")
+	}
+	if resolve == nil {
+		return fmt.Errorf("nil volume target resolver")
+	}
 	tracked := progressReader{reader: input, progress: progress, stream: true}
 	tr, r, err := openArchiveReader(tracked)
 	if err != nil {
@@ -307,7 +320,15 @@ func (s *Store) restoreBundleStream(tr *tar.Reader, opts RestoreOptions, resolve
 				return "", "", nil, false, sErr
 			}
 			// Targets are resolved only now: a resolver that creates the Docker
-			// volume must not run before the archive proved it carries it.
+			// volume must not run before the archive proved it carries it. Resolve
+			// every target before staging and reject aliases: restoring two logical
+			// volumes onto the same directory would silently let the last swap win.
+			type resolvedTarget struct {
+				name   string
+				target string
+			}
+			resolved := make([]resolvedTarget, 0, len(selected))
+			targetOwners := make(map[string]string, len(selected))
 			for _, name := range selected {
 				target, rErr := resolve(name)
 				if rErr != nil {
@@ -316,6 +337,18 @@ func (s *Store) restoreBundleStream(tr *tar.Reader, opts RestoreOptions, resolve
 				if rErr := checkRestoreTarget(target); rErr != nil {
 					return "", "", nil, false, rErr
 				}
+				canonical, rErr := resolvedPath(target)
+				if rErr != nil {
+					return "", "", nil, false, fmt.Errorf("resolve restore target %q: %w", target, rErr)
+				}
+				if owner, exists := targetOwners[canonical]; exists {
+					return "", "", nil, false, fmt.Errorf("volumes %q and %q resolve to the same restore target %q", owner, name, target)
+				}
+				targetOwners[canonical] = name
+				resolved = append(resolved, resolvedTarget{name: name, target: target})
+			}
+			for _, item := range resolved {
+				name, target := item.name, item.target
 				staging, rec, sErr := s.newStaging(filepath.Dir(target), "."+name+".restore-*")
 				if sErr != nil {
 					return "", "", nil, false, sErr
@@ -343,6 +376,12 @@ func (s *Store) restoreBundleStream(tr *tar.Reader, opts RestoreOptions, resolve
 			// The archive carries data the manifest does not declare: it is not
 			// the bundle it claims to be.
 			return "", "", nil, false, fmt.Errorf("bundle contains unexpected volume %q", vol)
+		}
+		if hdr.Typeflag == tar.TypeLink {
+			linkVol, _, linkOK := splitBundlePath(hdr.Linkname)
+			if !linkOK || linkVol != vol {
+				return "", "", nil, false, fmt.Errorf("bundle hard link %q points outside volume %q", hdr.Name, vol)
+			}
 		}
 		v := staged[vol]
 		if v == nil {
@@ -499,8 +538,15 @@ func (s *Store) openArchiveForRestore(path string, progress *Progress) (*tar.Rea
 // own manifest.json can still be extracted from the buffer.
 func probeBundleManifest(hdr *tar.Header, payload io.Reader) (isBundle bool, buffered *bytes.Reader, err error) {
 	name := strings.TrimPrefix(hdr.Name, "./")
-	if name != bundleManifestName || hdr.Typeflag != tar.TypeReg || hdr.Size > manifestProbeLimit {
+	if name != bundleManifestName || hdr.Typeflag != tar.TypeReg {
 		return false, nil, nil
+	}
+	if hdr.Size > manifestProbeLimit {
+		// Treating an oversized leading manifest as an ordinary volume file
+		// lets a padded, otherwise valid bundle bypass archive-kind detection.
+		// Refuse the ambiguous archive without buffering an attacker-controlled
+		// amount of memory.
+		return false, nil, fmt.Errorf("bundle manifest exceeds %d bytes", manifestProbeLimit)
 	}
 	data, err := io.ReadAll(io.LimitReader(payload, hdr.Size))
 	if err != nil {
@@ -690,10 +736,23 @@ func splitBundlePath(p string) (vol, rest string, ok bool) {
 		return "", "", false
 	}
 	vol = p[:i]
-	rest = strings.Trim(p[i+1:], "/")
 	if vol == "" {
 		return "", "", false
 	}
+	rest = p[i+1:]
+	if rest == "" {
+		return vol, "", true
+	}
+	// Tar paths always use '/'. Accept the conventional trailing slash on
+	// directory headers, but reject every other non-canonical spelling. In
+	// particular, "vol/../sibling" used to be routed outside vol's staged root
+	// and could make a non-empty bundle replace the live volume with emptiness.
+	trimmed := strings.TrimSuffix(rest, "/")
+	clean := path.Clean(trimmed)
+	if trimmed == "" || clean != trimmed || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", "", false
+	}
+	rest = clean
 	return vol, rest, true
 }
 
@@ -739,11 +798,11 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		}
 		sparse := newSparseFileWriter(of)
 		if _, err := io.Copy(sparse, io.LimitReader(reader, hdr.Size)); err != nil {
-			of.Close()
+			_ = of.Close()
 			return false, err
 		}
 		if err := sparse.Close(); err != nil {
-			of.Close()
+			_ = of.Close()
 			return false, err
 		}
 		if err := of.Close(); err != nil {
@@ -756,7 +815,9 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		if err := checkNoSymlinkAncestors(base, filepath.Dir(target)); err != nil {
 			return false, err
 		}
-		os.Remove(target)
+		if err := removeExistingEntry(target); err != nil {
+			return false, err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return false, err
 		}
@@ -767,7 +828,9 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		if err := checkNoSymlinkAncestors(base, target); err != nil {
 			return false, err
 		}
-		os.Remove(target)
+		if err := removeExistingEntry(target); err != nil {
+			return false, err
+		}
 		ln, err := safeJoin(base, hdr.Linkname)
 		if err != nil {
 			return false, err
@@ -788,7 +851,9 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return false, err
 		}
-		os.Remove(target)
+		if err := removeExistingEntry(target); err != nil {
+			return false, err
+		}
 		if err := unix.Mkfifo(target, uint32(hdr.Mode&0o777)); err != nil {
 			logger.Warn("FIFO not restored", LogField{Key: "path", Value: target}, LogField{Key: "error", Value: err})
 			return false, nil
@@ -806,8 +871,17 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		} else {
 			mode |= unix.S_IFBLK
 		}
-		os.Remove(target)
+		if err := removeExistingEntry(target); err != nil {
+			return false, err
+		}
+		if hdr.Devmajor < 0 || hdr.Devmajor > 1<<32-1 || hdr.Devminor < 0 || hdr.Devminor > 1<<32-1 {
+			return false, fmt.Errorf("invalid device numbers for %q: major=%d minor=%d", hdr.Name, hdr.Devmajor, hdr.Devminor)
+		}
 		dev := unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor))
+		maxInt := uint64(^uint(0) >> 1)
+		if dev > maxInt {
+			return false, fmt.Errorf("encoded device number for %q overflows int on this platform", hdr.Name)
+		}
 		if err := unix.Mknod(target, mode, int(dev)); err != nil {
 			// Creating device nodes needs CAP_MKNOD. A restore running without
 			// it must not fail outright: the rest of the volume is still valid.
@@ -820,6 +894,13 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		return false, nil
 	}
 	return true, nil
+}
+
+func removeExistingEntry(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove existing archive entry %q: %w", path, err)
+	}
+	return nil
 }
 
 // checkNoSymlinkAncestors rejects extracting under a path whose existing

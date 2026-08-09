@@ -36,7 +36,6 @@ var cliLogger = dvol.NewLogger(os.Stderr, dvol.LevelInfo)
 type app struct {
 	store          *dvol.Store
 	docker         dockerVolumeClient
-	out            *tabwriter.Writer
 	destinationSet bool
 }
 
@@ -201,14 +200,14 @@ func extractGlobalFlags(args []string) globalFlags {
 // in Docker's volume.
 func (a *app) volumeSource(name string) (string, error) {
 	if a.docker == nil {
-		return "", fmt.Errorf("Docker CLI is required to resolve volume %q", name)
+		return "", fmt.Errorf("docker CLI is required to resolve volume %q", name)
 	}
 	info, err := a.docker.Inspect(name)
 	if err != nil {
 		return "", err
 	}
 	if info.Mountpoint == "" {
-		return "", fmt.Errorf("Docker volume %q has no usable mountpoint", name)
+		return "", fmt.Errorf("docker volume %q has no usable mountpoint", name)
 	}
 	return info.Mountpoint, nil
 }
@@ -216,7 +215,7 @@ func (a *app) volumeSource(name string) (string, error) {
 // volumeTarget resolves the mountpoint of a volume, creating it if needed.
 func (a *app) volumeTarget(name string) (string, error) {
 	if a.docker == nil {
-		return "", fmt.Errorf("Docker CLI is required to resolve volume %q", name)
+		return "", fmt.Errorf("docker CLI is required to resolve volume %q", name)
 	}
 	source, err := a.volumeSource(name)
 	if errors.Is(err, errDockerVolumeNotFound) {
@@ -225,7 +224,7 @@ func (a *app) volumeTarget(name string) (string, error) {
 			return "", fmt.Errorf("create Docker volume %q: %w", name, createErr)
 		}
 		if info.Mountpoint == "" {
-			return "", fmt.Errorf("Docker volume %q has no usable mountpoint", name)
+			return "", fmt.Errorf("docker volume %q has no usable mountpoint", name)
 		}
 		return info.Mountpoint, nil
 	} else if err != nil {
@@ -241,10 +240,12 @@ func (a *app) checkVolumeIdle(name string, force bool) error {
 	}
 	containers, err := a.docker.ContainersUsing(name)
 	if err != nil {
-		// Not being able to ask Docker must not block a restore; warn instead.
-		cliLogger.Warn("cannot determine whether the volume is in use",
-			dvol.LogField{Key: "volume", Value: name}, dvol.LogField{Key: "error", Value: err})
-		return nil
+		if force {
+			cliLogger.Warn("cannot determine whether the volume is in use; proceeding because --force was supplied",
+				dvol.LogField{Key: "volume", Value: name}, dvol.LogField{Key: "error", Value: err})
+			return nil
+		}
+		return fmt.Errorf("cannot determine whether volume %q is mounted by a running container: %w (pass --force to proceed anyway)", name, err)
 	}
 	if len(containers) == 0 {
 		return nil
@@ -297,7 +298,9 @@ func (a *app) cmdList(args []string) {
 	for _, v := range dockerVolumes {
 		fmt.Fprintf(tw, "%s\t%s\t-\t-\t%s\n", v.Name, v.Driver, v.Mountpoint)
 	}
-	tw.Flush()
+	if err := tw.Flush(); err != nil {
+		fail(err)
+	}
 }
 
 // cmdBackups: docker dvol backups <volume>
@@ -314,7 +317,9 @@ func (a *app) cmdBackups(args []string) {
 	for _, b := range infos {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", b.Name, humanSize(b.Size), b.CreatedAt.Format("2006-01-02 15:04"))
 	}
-	tw.Flush()
+	if err := tw.Flush(); err != nil {
+		fail(err)
+	}
 }
 
 // cmdVerify: docker dvol verify <volume> [backup] | docker dvol verify --archive <path>
@@ -326,6 +331,12 @@ func (a *app) cmdVerify(args []string) {
 		fail(err)
 	}
 	rest := fs.Args()
+	if *archive != "" && len(rest) > 0 {
+		fail("--archive cannot be combined with positional volume or backup arguments")
+	}
+	if *archive == "" && len(rest) > 2 {
+		fail("verify accepts at most a volume and one backup selector")
+	}
 	paths := []string{}
 	switch {
 	case *archive != "":
@@ -676,6 +687,9 @@ func (a *app) cmdComposeBackup(args []string) {
 	if err := fs.Parse(args); err != nil {
 		fail(err)
 	}
+	if len(fs.Args()) > 0 {
+		fail("compose-backup accepts options only; volume selection comes from the compose file")
+	}
 
 	opts := dvol.BackupOptions{Compression: dvol.Compression(*comp), Level: *level, Threads: *threads, ArchiveName: archiveName, Timestamp: includeTimestamp, TimestampUTC: timestampUTC, Overwrite: *overwrite}
 	if err := opts.Validate(); err != nil {
@@ -707,6 +721,9 @@ func (a *app) cmdComposeBackup(args []string) {
 	}
 	if len(names) == 0 {
 		fail(fmt.Sprintf("no volumes from %s exist in Docker", path))
+	}
+	if err := checkDuplicates(names); err != nil {
+		fail(fmt.Errorf("compose file resolves multiple entries to one Docker volume: %w", err))
 	}
 	if *stdout {
 		if a.destinationSet {
@@ -741,6 +758,9 @@ func (a *app) cmdComposeRestore(args []string) {
 		fail(err)
 	}
 	rest := fs.Args()
+	if len(rest) > 1 {
+		fail("compose-restore accepts at most one archive path")
+	}
 	if *spool && !*stdin {
 		fail("--spool requires --stdin")
 	}
@@ -759,6 +779,9 @@ func (a *app) cmdComposeRestore(args []string) {
 	names := composeVolumeNames(cf)
 	if len(names) == 0 {
 		fail(fmt.Sprintf("%s declares no named volumes", path))
+	}
+	if err := checkDuplicates(names); err != nil {
+		fail(fmt.Errorf("compose file resolves multiple entries to one Docker volume: %w", err))
 	}
 	opts := dvol.RestoreOptions{Volumes: names, AllowMissing: !*strict}
 
@@ -905,6 +928,9 @@ func (m *multiFlag) Set(v string) error {
 }
 
 func resolveComposeFile(files []string) (string, error) {
+	if len(files) > 1 {
+		return "", fmt.Errorf("multiple -f compose files are not supported; merge them with docker compose config and pass the result")
+	}
 	if len(files) > 0 {
 		return files[0], nil
 	}
@@ -914,7 +940,7 @@ func resolveComposeFile(files []string) (string, error) {
 			return abs, nil
 		}
 	}
-	return "", fmt.Errorf("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yml); use -f")
+	return "", fmt.Errorf("no compose file found (looked for compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml); use -f")
 }
 
 // existingVolumes splits the declared compose volumes into the ones Docker
@@ -966,28 +992,24 @@ func latestBundle(dir, project string, volumes []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for i := len(infos) - 1; i >= 0; i-- {
-		if bundleBelongsToProject(infos[i].Name, project) {
-			return infos[i].Path, nil
-		}
-	}
 	want := map[string]bool{}
 	for _, v := range volumes {
 		want[v] = true
 	}
 	for i := len(infos) - 1; i >= 0; i-- {
 		report, err := dvol.InspectArchive(infos[i].Path)
-		if err != nil || !report.Bundle || len(report.Volumes) != len(want) {
+		if err != nil || !report.Bundle {
 			continue
 		}
-		match := true
+		subset := len(report.Volumes) > 0
 		for _, v := range report.Volumes {
 			if !want[v] {
-				match = false
+				subset = false
 				break
 			}
 		}
-		if match {
+		exact := subset && len(report.Volumes) == len(want)
+		if exact || (subset && bundleBelongsToProject(infos[i].Name, project)) {
 			return infos[i].Path, nil
 		}
 	}

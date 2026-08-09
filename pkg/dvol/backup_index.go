@@ -31,10 +31,48 @@ type flatBackupIndex struct {
 }
 
 type flatBackupIndexEntry struct {
+	Volume          string              `json:"volume"`
+	Name            string              `json:"name"`
+	CreatedAt       time.Time           `json:"created_at"`
+	Pending         bool                `json:"pending,omitempty"`
+	Previous        *flatBackupPrevious `json:"previous,omitempty"`
+	PreviousArchive bool                `json:"previous_archive,omitempty"`
+	PreviousDev     uint64              `json:"previous_dev,omitempty"`
+	PreviousIno     uint64              `json:"previous_ino,omitempty"`
+}
+
+type flatBackupPrevious struct {
 	Volume    string    `json:"volume"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
-	Pending   bool      `json:"pending,omitempty"`
+}
+
+func fileIdentity(info os.FileInfo) (dev, ino uint64, ok bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return uint64(st.Dev), uint64(st.Ino), true
+}
+
+func settleFlatPending(entry flatBackupIndexEntry, info os.FileInfo) (flatBackupIndexEntry, bool) {
+	if entry.PreviousArchive {
+		dev, ino, ok := fileIdentity(info)
+		if ok && dev == entry.PreviousDev && ino == entry.PreviousIno {
+			if entry.Previous == nil {
+				return flatBackupIndexEntry{}, false
+			}
+			return flatBackupIndexEntry{
+				Volume: entry.Previous.Volume, Name: entry.Previous.Name, CreatedAt: entry.Previous.CreatedAt,
+			}, true
+		}
+	}
+	entry.Pending = false
+	entry.Previous = nil
+	entry.PreviousArchive = false
+	entry.PreviousDev = 0
+	entry.PreviousIno = 0
+	return entry, true
 }
 
 func (s *Store) flatIndexPath() string {
@@ -106,10 +144,20 @@ func (s *Store) loadFlatIndex() (flatBackupIndex, bool, error) {
 			continue
 		}
 		if entry.Pending {
-			// The archive publication is atomic. If it exists, the pending
-			// operation completed far enough to be safely visible.
-			entry.Pending = false
+			if s.reservationHeld(entry.Name) {
+				// An overwrite keeps the previous archive at the final path while
+				// the replacement is written. Only settle the transaction after
+				// its owner has released the reservation lock.
+				seen[entry.Name] = true
+				kept = append(kept, entry)
+				continue
+			}
+			var keep bool
+			entry, keep = settleFlatPending(entry, info)
 			changed = true
+			if !keep {
+				continue
+			}
 		}
 		seen[entry.Name] = true
 		kept = append(kept, entry)
@@ -145,7 +193,7 @@ func (s *Store) reserveFlatArchive(name string) (*flatReservation, error) {
 		return nil, err
 	}
 	path := s.flatReservationPath(name)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +219,7 @@ func (s *Store) withFlatIndexLock(fn func(*flatBackupIndex) error) error {
 	if err := os.MkdirAll(s.backupsDir(), 0o755); err != nil {
 		return err
 	}
-	lock, err := os.OpenFile(s.flatLockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	lock, err := os.OpenFile(s.flatLockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -199,7 +247,7 @@ func (s *Store) readFlatIndex() (flatBackupIndex, error) {
 	if err := os.MkdirAll(s.backupsDir(), 0o755); err != nil {
 		return result, err
 	}
-	lock, err := os.OpenFile(s.flatLockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	lock, err := os.OpenFile(s.flatLockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return result, err
 	}
@@ -322,29 +370,34 @@ func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts Back
 	defer reservation.release()
 
 	if err := s.withFlatIndexLock(func(idx *flatBackupIndex) error {
+		var previous *flatBackupPrevious
 		filtered := idx.Entries[:0]
 		for _, entry := range idx.Entries {
 			if entry.Name == name {
 				if !opts.Overwrite {
 					return fmt.Errorf("%w: %s (use --overwrite to replace it)", ErrArchiveExists, name)
 				}
+				previous = &flatBackupPrevious{Volume: entry.Volume, Name: entry.Name, CreatedAt: entry.CreatedAt}
 				continue
 			}
 			filtered = append(filtered, entry)
 		}
 		idx.Entries = filtered
-		if _, err := os.Lstat(path); err == nil {
+		var previousArchive bool
+		var previousDev, previousIno uint64
+		if info, err := os.Lstat(path); err == nil {
 			if !opts.Overwrite {
 				return fmt.Errorf("%w: %s (use --overwrite to replace it)", ErrArchiveExists, name)
 			}
+			previousArchive = true
+			previousDev, previousIno, _ = fileIdentity(info)
 		} else if !os.IsNotExist(err) {
 			return err
 		}
 		idx.Entries = append(idx.Entries, flatBackupIndexEntry{
-			Volume:    volume,
-			Name:      name,
-			CreatedAt: time.Now().UTC(),
-			Pending:   true,
+			Volume: volume, Name: name, CreatedAt: time.Now().UTC(), Pending: true,
+			Previous: previous, PreviousArchive: previousArchive,
+			PreviousDev: previousDev, PreviousIno: previousIno,
 		})
 		return nil
 	}); err != nil {
@@ -356,8 +409,17 @@ func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts Back
 		_ = s.withFlatIndexLock(func(idx *flatBackupIndex) error {
 			filtered := idx.Entries[:0]
 			for _, entry := range idx.Entries {
-				if entry.Name != name {
+				if entry.Name != name || !entry.Pending {
 					filtered = append(filtered, entry)
+					continue
+				}
+				info, statErr := os.Stat(path)
+				if statErr == nil {
+					if settled, keep := settleFlatPending(entry, info); keep {
+						filtered = append(filtered, settled)
+					}
+				} else if !os.IsNotExist(statErr) {
+					return statErr
 				}
 			}
 			idx.Entries = filtered
@@ -370,6 +432,10 @@ func (s *Store) writeFlatBackupWithProgress(volume, name, path string, opts Back
 		for i := range idx.Entries {
 			if idx.Entries[i].Name == name {
 				idx.Entries[i].Pending = false
+				idx.Entries[i].Previous = nil
+				idx.Entries[i].PreviousArchive = false
+				idx.Entries[i].PreviousDev = 0
+				idx.Entries[i].PreviousIno = 0
 				return nil
 			}
 		}
