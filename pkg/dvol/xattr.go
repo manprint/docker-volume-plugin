@@ -2,6 +2,7 @@ package dvol
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -147,17 +148,24 @@ func xattrsFromPAX(records map[string]string) map[string]string {
 }
 
 // applyXattrs restores extended attributes on path without following symlinks.
-// Attributes the current process is not allowed to set (security.*, system.*
-// without the matching privilege) are reported to the caller as skipped rather
-// than failing the whole restore: losing an SELinux label must not cost the
-// operator their data.
-func applyXattrs(path string, attrs map[string]string, logger *Logger) {
+// Attributes the current process is not allowed to set are always reported.
+// Strict restores return the joined errors so an incomplete staging tree is
+// never published; best-effort restores explicitly opt into warning-only mode.
+func applyXattrs(path string, attrs map[string]string, logger *Logger, bestEffort bool) error {
+	var result error
 	for name, value := range attrs {
 		if err := unix.Lsetxattr(path, name, []byte(value), 0); err != nil {
-			logger.Warn("extended attribute not restored",
-				LogField{Key: "path", Value: path},
-				LogField{Key: "xattr", Value: name},
-				LogField{Key: "error", Value: err})
+			if logger != nil {
+				logger.Warn("extended attribute not restored",
+					LogField{Key: "path", Value: path},
+					LogField{Key: "xattr", Value: name},
+					LogField{Key: "error", Value: err})
+			}
+			result = errors.Join(result, fmt.Errorf("restore extended attribute %q on %q: %w", name, path, err))
 		}
 	}
+	if bestEffort {
+		return nil
+	}
+	return result
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,13 +24,25 @@ func newCLIStore(t *testing.T) *dvol.Store {
 type fakeDockerVolumes struct {
 	volumes           map[string]dockerVolumeInfo
 	createMountpoints map[string]string
+	concurrentCreate  map[string]dockerVolumeInfo
 	inUse             map[string][]string
+	inUseAfterFirst   map[string][]string
+	containerChecks   map[string]int
 	inUseErr          error
+	removeErr         error
+	removed           []string
 }
 
 func (f *fakeDockerVolumes) ContainersUsing(name string) ([]string, error) {
 	if f.inUseErr != nil {
 		return nil, f.inUseErr
+	}
+	if f.containerChecks == nil {
+		f.containerChecks = map[string]int{}
+	}
+	f.containerChecks[name]++
+	if f.containerChecks[name] > 1 && len(f.inUseAfterFirst[name]) != 0 {
+		return f.inUseAfterFirst[name], nil
 	}
 	return f.inUse[name], nil
 }
@@ -58,16 +71,30 @@ func (f *fakeDockerVolumes) Inspect(name string) (dockerVolumeInfo, error) {
 	return volume, nil
 }
 
-func (f *fakeDockerVolumes) Create(name string) (dockerVolumeInfo, error) {
+func (f *fakeDockerVolumes) Create(name, restoreOwner string) (dockerVolumeInfo, error) {
 	if volume, ok := f.volumes[name]; ok {
 		return volume, nil
 	}
+	if volume, ok := f.concurrentCreate[name]; ok {
+		f.volumes[name] = volume
+		return volume, nil
+	}
 	if mountpoint, ok := f.createMountpoints[name]; ok {
-		volume := dockerVolumeInfo{Name: name, Driver: "local", Mountpoint: mountpoint}
+		volume := dockerVolumeInfo{Name: name, Driver: "local", Mountpoint: mountpoint,
+			Labels: map[string]string{restoreOwnerLabel: restoreOwner}}
 		f.volumes[name] = volume
 		return volume, nil
 	}
 	return dockerVolumeInfo{}, errDockerVolumeNotFound
+}
+
+func (f *fakeDockerVolumes) Remove(name string) error {
+	if f.removeErr != nil {
+		return f.removeErr
+	}
+	delete(f.volumes, name)
+	f.removed = append(f.removed, name)
+	return nil
 }
 
 func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
@@ -107,6 +134,37 @@ func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
 	}
 }
 
+func TestRestoreRechecksRunningContainersImmediatelyBeforeCommit(t *testing.T) {
+	store := newCLIStore(t)
+	source, target := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "data.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := store.BackupSourceWithOptions("data", source, dvol.BackupOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "live.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeDockerVolumes{
+		volumes: map[string]dockerVolumeInfo{
+			"data": {Name: "data", Driver: "local", Mountpoint: target},
+		},
+		createMountpoints: map[string]string{},
+		inUseAfterFirst:   map[string][]string{"data": {"late-container"}},
+	}
+	a := &app{store: store, docker: fake}
+
+	err = a.restoreVolume("data", archive, false)
+	if err == nil || !strings.Contains(err.Error(), "late-container") {
+		t.Fatalf("late container mount was not refused: %v", err)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(target, "live.txt")); readErr != nil || string(got) != "keep" {
+		t.Fatalf("target changed after pre-commit refusal: %q err=%v", got, readErr)
+	}
+}
+
 func TestVolumeSourceDoesNotUseArchiveRepositoryAsDockerVolume(t *testing.T) {
 	store := newCLIStore(t)
 	if err := store.Create("orphan", nil); err != nil {
@@ -118,6 +176,51 @@ func TestVolumeSourceDoesNotUseArchiveRepositoryAsDockerVolume(t *testing.T) {
 	}}
 	if _, err := a.volumeSource("orphan"); !errors.Is(err, errDockerVolumeNotFound) {
 		t.Fatalf("expected Docker lookup failure, got %v", err)
+	}
+}
+
+func TestVolumeSourceSupportsLocalBindDriverOptions(t *testing.T) {
+	device := t.TempDir()
+	a := &app{store: newCLIStore(t), docker: &fakeDockerVolumes{
+		volumes: map[string]dockerVolumeInfo{"data": {
+			Name:       "data",
+			Driver:     "local",
+			Mountpoint: filepath.Join(t.TempDir(), "transient-docker-mount"),
+			Options: map[string]string{
+				"type": "none", "device": device, "o": "bind",
+			},
+		}},
+		createMountpoints: map[string]string{},
+	}}
+
+	source, err := a.volumeSource("data")
+	if err != nil {
+		t.Fatalf("local bind-backed volume was rejected: %v", err)
+	}
+	if source != device {
+		t.Fatalf("local bind-backed volume resolved to %q, want device %q", source, device)
+	}
+}
+
+func TestVolumeSourceRejectsUnsupportedOrRemoteDrivers(t *testing.T) {
+	store := newCLIStore(t)
+	for _, tc := range []struct {
+		name string
+		info dockerVolumeInfo
+	}{
+		{name: "plugin", info: dockerVolumeInfo{Name: "data", Driver: "nfs-plugin", Mountpoint: t.TempDir()}},
+		{name: "local-nfs", info: dockerVolumeInfo{Name: "data", Driver: "local", Mountpoint: t.TempDir(), Options: map[string]string{"type": "nfs"}}},
+		{name: "relative-bind", info: dockerVolumeInfo{Name: "data", Driver: "local", Mountpoint: t.TempDir(), Options: map[string]string{"type": "none", "device": "relative", "o": "bind"}}},
+		{name: "read-only-bind", info: dockerVolumeInfo{Name: "data", Driver: "local", Mountpoint: t.TempDir(), Options: map[string]string{"type": "none", "device": t.TempDir(), "o": "bind,ro"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &app{store: store, docker: &fakeDockerVolumes{
+				volumes: map[string]dockerVolumeInfo{"data": tc.info}, createMountpoints: map[string]string{},
+			}}
+			if _, err := a.volumeSource("data"); err == nil || !strings.Contains(err.Error(), "supports") {
+				t.Fatalf("unsupported Docker volume was accepted: %v", err)
+			}
+		})
 	}
 }
 
@@ -146,6 +249,120 @@ func TestRestoreCreatesMissingDockerVolume(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(mountpoint, "data.txt"))
 	if err != nil || string(got) != "seed-data" {
 		t.Fatalf("new Docker volume data wrong: %q err=%v", got, err)
+	}
+	if len(fake.removed) != 0 {
+		t.Fatalf("successful restore removed its Docker volume: %v", fake.removed)
+	}
+}
+
+func TestFailedRestoreRemovesDockerVolumeCreatedByTheOperation(t *testing.T) {
+	store := newCLIStore(t)
+	mountpoint := t.TempDir()
+	fake := &fakeDockerVolumes{
+		volumes:           map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{"new-local": mountpoint},
+	}
+	a := &app{store: store, docker: fake}
+	broken := filepath.Join(t.TempDir(), "broken.tar.gz")
+	if err := os.WriteFile(broken, []byte("not an archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.restoreVolume("new-local", broken, false); err == nil {
+		t.Fatal("invalid archive unexpectedly restored")
+	}
+	if _, ok := fake.volumes["new-local"]; ok {
+		t.Fatal("failed restore left the Docker volume created by the operation")
+	}
+	if len(fake.removed) != 1 || fake.removed[0] != "new-local" {
+		t.Fatalf("unexpected rollback removals: %v", fake.removed)
+	}
+}
+
+func TestFailedRestoreDoesNotRemoveVolumeWonByConcurrentCreator(t *testing.T) {
+	mountpoint := t.TempDir()
+	fake := &fakeDockerVolumes{
+		volumes:           map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{},
+		concurrentCreate: map[string]dockerVolumeInfo{
+			"raced": {Name: "raced", Driver: "local", Mountpoint: mountpoint},
+		},
+	}
+	a := &app{store: newCLIStore(t), docker: fake}
+	targets := a.newRestoreTargets(false)
+	if _, err := targets.Resolve("raced"); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("restore failed after create race")
+	if err := targets.finish(injected); !errors.Is(err, injected) {
+		t.Fatalf("restore error lost: %v", err)
+	}
+	if len(fake.removed) != 0 {
+		t.Fatalf("concurrently created volume was removed: %v", fake.removed)
+	}
+	if _, ok := fake.volumes["raced"]; !ok {
+		t.Fatal("concurrently created volume disappeared")
+	}
+}
+
+func TestFailedRestorePreservesCreatedVolumeThatReceivedConcurrentData(t *testing.T) {
+	store := newCLIStore(t)
+	mountpoint := t.TempDir()
+	fake := &fakeDockerVolumes{
+		volumes:           map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{"new-local": mountpoint},
+	}
+	a := &app{store: store, docker: fake}
+	targets := a.newRestoreTargets(false)
+	if _, err := targets.Resolve("new-local"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mountpoint, "concurrent.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := targets.finish(errors.New("restore failed"))
+	if err == nil || !strings.Contains(err.Error(), "no longer empty") {
+		t.Fatalf("expected a safe rollback warning, got %v", err)
+	}
+	if _, ok := fake.volumes["new-local"]; !ok {
+		t.Fatal("rollback removed a created volume after it received data")
+	}
+}
+
+func TestFailedBundleRestoreRemovesAllDockerVolumesCreatedByTheOperation(t *testing.T) {
+	store := newCLIStore(t)
+	sources := map[string]string{"app": t.TempDir(), "db": t.TempDir()}
+	for name, source := range sources {
+		if err := os.WriteFile(filepath.Join(source, "data.txt"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var archive bytes.Buffer
+	if err := store.BackupBundleSourcesToWriter([]string{"app", "db"}, sources, dvol.BackupOptions{Threads: 1}, &archive); err != nil {
+		t.Fatal(err)
+	}
+	truncated := archive.Bytes()[:archive.Len()-8]
+	appTarget, dbTarget := t.TempDir(), t.TempDir()
+	fake := &fakeDockerVolumes{
+		volumes: map[string]dockerVolumeInfo{},
+		createMountpoints: map[string]string{
+			"app": appTarget,
+			"db":  dbTarget,
+		},
+	}
+	a := &app{store: store, docker: fake}
+
+	err := a.restoreBundle(false, func(resolve dvol.VolumeTargetResolver, beforeCommit func([]string) error) error {
+		return store.RestoreBundleReader(bytes.NewReader(truncated), dvol.RestoreOptions{BeforeCommit: beforeCommit}, resolve)
+	})
+	if err == nil {
+		t.Fatal("truncated bundle unexpectedly restored")
+	}
+	if len(fake.volumes) != 0 {
+		t.Fatalf("failed bundle restore left created Docker volumes: %v", fake.volumes)
+	}
+	if strings.Join(fake.removed, ",") != "db,app" {
+		t.Fatalf("created volumes were not rolled back in reverse order: %v", fake.removed)
 	}
 }
 

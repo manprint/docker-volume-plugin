@@ -15,6 +15,8 @@ mkdir -p "$REMOTE_ROOT"
 VOLUMES=""
 COMPOSE_PROJECTS=""
 NEW_VOLUME=""
+RCLONE_IMAGE="${RCLONE_IMAGE:-rclone/rclone:1.74.2}"
+readonly RCLONE_IMAGE
 
 if [[ "$(id -u)" -eq 0 ]]; then
   DVOL_PREFIX=(docker dvol)
@@ -34,7 +36,7 @@ cleanup() {
   set +e
   for volume in $VOLUMES; do docker volume rm -f "$volume" >/dev/null 2>&1; done
   for project in $COMPOSE_PROJECTS; do docker compose -p "$project" -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1; done
-  if [[ -d "$REMOTE_ROOT" ]]; then docker run --rm -i -v "$REMOTE_ROOT:/remote" rclone/rclone:latest purge /remote >/dev/null 2>&1; fi
+  if [[ -d "$REMOTE_ROOT" ]]; then docker run --rm -i -v "$REMOTE_ROOT:/remote" "$RCLONE_IMAGE" purge /remote >/dev/null 2>&1; fi
   rm -f "$COMPOSE_FILE"
   rmdir "$REMOTE_ROOT" >/dev/null 2>&1 || true
   rmdir "$WORK_DIR" >/dev/null 2>&1 || true
@@ -42,7 +44,7 @@ cleanup() {
 trap cleanup EXIT
 
 require_image() { local image="$1"; docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >/dev/null; }
-rclone_cmd() { docker run --rm -i -v "$REMOTE_ROOT:/remote" rclone/rclone:latest "$@"; }
+rclone_cmd() { docker run --rm -i -v "$REMOTE_ROOT:/remote" "$RCLONE_IMAGE" "$@"; }
 new_volume() {
   local name="dvol_stream_$PROJECT-$1"
   docker volume create "$name" >/dev/null
@@ -219,7 +221,7 @@ YAML
   docker compose -p "$PROJECT" -f "$COMPOSE_FILE" down -v >/dev/null
 }
 
-require_image rclone/rclone:latest
+require_image "$RCLONE_IMAGE"
 require_image alpine:3.20
 for compression in gzip xz zstd lz4; do
   run_single_matrix "$compression"

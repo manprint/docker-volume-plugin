@@ -322,7 +322,21 @@ func writeArchive(path string, opts BackupOptions, populate func(*tar.Writer) er
 	return writeArchiveWithProgress(path, DefaultArchiveMode, opts, nil, populate)
 }
 
+type archivePublicationOps struct {
+	close   func(*os.File) error
+	syncDir func(string) error
+}
+
+var defaultArchivePublicationOps = archivePublicationOps{
+	close:   (*os.File).Close,
+	syncDir: syncDir,
+}
+
 func writeArchiveWithProgress(path string, mode os.FileMode, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error) error {
+	return writeArchiveWithProgressOps(path, mode, opts, progress, populate, defaultArchivePublicationOps)
+}
+
+func writeArchiveWithProgressOps(path string, mode os.FileMode, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error, publish archivePublicationOps) error {
 	f, err := os.CreateTemp(filepath.Dir(path), tempArchivePrefix+"*")
 	if err != nil {
 		return err
@@ -372,13 +386,13 @@ func writeArchiveWithProgress(path string, mode os.FileMode, opts BackupOptions,
 		}
 		_ = os.Remove(tmp)
 	}
-	if err := f.Close(); err != nil {
-		return err
+	if err := publish.close(f); err != nil {
+		return &ArchivePublishedError{Path: path, Err: fmt.Errorf("close archive: %w", err)}
 	}
 	// The rename is atomic, but syncing the parent makes the new directory
 	// entry durable across a power loss on filesystems that support fsync.
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return fmt.Errorf("archive published but directory sync failed: %w", err)
+	if err := publish.syncDir(filepath.Dir(path)); err != nil {
+		return &ArchivePublishedError{Path: path, Err: fmt.Errorf("sync archive directory: %w", err)}
 	}
 	return nil
 }
@@ -760,78 +774,87 @@ func walkReadOnly(root string, opts readOptions, visit func(readOnlyTreeEntry) e
 	return walkReadOnlyDir(rootDir, root, "", opts, visit)
 }
 
+const directoryReadBatchSize = 4096
+
 func walkReadOnlyDir(dir *os.File, dirPath, prefix string, opts readOptions, visit func(readOnlyTreeEntry) error) error {
-	// Names only: the traversal re-stats every entry anyway, and a directory
-	// with millions of children must not cost one os.FileInfo each.
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		return err
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		path := filepath.Join(dirPath, name)
-		info, err := os.Lstat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// The entry vanished between readdir and lstat. A live volume
-				// legitimately does this; the archive simply will not contain it.
-				opts.logger.Warn("source entry disappeared during backup", LogField{Key: "path", Value: path})
-				continue
-			}
-			return err
+	// Read bounded batches: the traversal re-stats every entry anyway, and a
+	// directory with millions of children must not allocate one giant name
+	// slice. Sorting each batch retains stable local ordering without O(n) peak
+	// memory for the whole directory.
+	for {
+		names, readErr := dir.Readdirnames(directoryReadBatchSize)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
 		}
-		rel := name
-		if prefix != "" {
-			rel = filepath.Join(prefix, name)
-		}
-		entry := readOnlyTreeEntry{path: path, rel: filepath.ToSlash(rel), info: info}
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			entry.link, err = readlinkAt(dir, name, info, opts)
+		sort.Strings(names)
+		for _, name := range names {
+			path := filepath.Join(dirPath, name)
+			info, err := os.Lstat(path)
 			if err != nil {
 				if os.IsNotExist(err) {
+					// The entry vanished between readdir and lstat. A live volume
+					// legitimately does this; the archive simply will not contain it.
 					opts.logger.Warn("source entry disappeared during backup", LogField{Key: "path", Value: path})
 					continue
 				}
 				return err
 			}
-			entry.xattrs, err = readPathXattrs(path)
-			if err != nil {
-				return fmt.Errorf("read extended attributes of symlink %q: %w", path, err)
+			rel := name
+			if prefix != "" {
+				rel = filepath.Join(prefix, name)
 			}
-			if err := visit(entry); err != nil {
-				return err
-			}
-		case info.IsDir() || info.Mode().IsRegular():
-			child, actual, err := openReadOnlyAt(dir, name, info, opts)
-			if err != nil {
-				if os.IsNotExist(err) {
-					opts.logger.Warn("source entry disappeared during backup", LogField{Key: "path", Value: path})
-					continue
+			entry := readOnlyTreeEntry{path: path, rel: filepath.ToSlash(rel), info: info}
+			switch {
+			case info.Mode()&os.ModeSymlink != 0:
+				entry.link, err = readlinkAt(dir, name, info, opts)
+				if err != nil {
+					if os.IsNotExist(err) {
+						opts.logger.Warn("source entry disappeared during backup", LogField{Key: "path", Value: path})
+						continue
+					}
+					return err
 				}
-				return err
+				entry.xattrs, err = readPathXattrs(path)
+				if err != nil {
+					return fmt.Errorf("read extended attributes of symlink %q: %w", path, err)
+				}
+				if err := visit(entry); err != nil {
+					return err
+				}
+			case info.IsDir() || info.Mode().IsRegular():
+				child, actual, err := openReadOnlyAt(dir, name, info, opts)
+				if err != nil {
+					if os.IsNotExist(err) {
+						opts.logger.Warn("source entry disappeared during backup", LogField{Key: "path", Value: path})
+						continue
+					}
+					return err
+				}
+				entry.info = actual
+				entry.file = child
+				err = visit(entry)
+				if err == nil && actual.IsDir() {
+					err = walkReadOnlyDir(child, path, rel, opts, visit)
+				}
+				closeErr := child.Close()
+				if err != nil {
+					return err
+				}
+				if closeErr != nil {
+					return closeErr
+				}
+			default:
+				entry.xattrs, err = readPathXattrs(path)
+				if err != nil {
+					return fmt.Errorf("read extended attributes of special entry %q: %w", path, err)
+				}
+				if err := visit(entry); err != nil {
+					return err
+				}
 			}
-			entry.info = actual
-			entry.file = child
-			err = visit(entry)
-			if err == nil && actual.IsDir() {
-				err = walkReadOnlyDir(child, path, rel, opts, visit)
-			}
-			closeErr := child.Close()
-			if err != nil {
-				return err
-			}
-			if closeErr != nil {
-				return closeErr
-			}
-		default:
-			entry.xattrs, err = readPathXattrs(path)
-			if err != nil {
-				return fmt.Errorf("read extended attributes of special entry %q: %w", path, err)
-			}
-			if err := visit(entry); err != nil {
-				return err
-			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
 		}
 	}
 	return nil

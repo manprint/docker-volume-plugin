@@ -47,6 +47,10 @@ type Config struct {
 	// entry that cannot be represented in a tar archive (unix sockets). It is
 	// enabled by default; set StrictEntries to turn those into errors.
 	StrictEntries bool
+	// BestEffortMetadata lets restore continue after it cannot recreate a FIFO,
+	// device node, extended attribute, ACL or file capability. The safe default
+	// is strict: an incomplete result returns an error and is not published.
+	BestEffortMetadata bool
 }
 
 func (c Config) archiveMode() os.FileMode {
@@ -68,6 +72,9 @@ type Volume struct {
 // Store manages backup archives and the staging data used by backup/restore.
 type Store struct {
 	cfg Config
+	// replaceRename is an internal fault-injection seam for the directory-swap
+	// transaction tests. Production stores leave it nil and use os.Rename.
+	replaceRename func(oldPath, newPath string) error
 }
 
 // VolumeTargetResolver returns the directory a bundle volume must be restored
@@ -102,7 +109,28 @@ var (
 	// ErrArchiveExists is returned when publishing an archive would replace an
 	// existing one and --overwrite was not requested.
 	ErrArchiveExists = errors.New("backup archive already exists")
+	// ErrArchivePublished classifies a late durability error after the final
+	// archive path has already become visible. Callers must not retry blindly:
+	// the Path carried by ArchivePublishedError names the completed archive.
+	ErrArchivePublished = errors.New("backup archive was published but durability confirmation failed")
 	// ErrAtimeUnavailable is returned when the source cannot be read without
 	// updating its access times and AllowAtime is not set.
 	ErrAtimeUnavailable = errors.New("source cannot be read without updating access times")
 )
+
+// ArchivePublishedError reports that archive publication succeeded, but a
+// subsequent close or parent-directory sync failed. The archive at Path is
+// complete; only its persistence across an immediate system failure is
+// uncertain.
+type ArchivePublishedError struct {
+	Path string
+	Err  error
+}
+
+func (e *ArchivePublishedError) Error() string {
+	return fmt.Sprintf("%v: %s: %v; the completed archive exists, verify it before retrying", ErrArchivePublished, e.Path, e.Err)
+}
+
+func (e *ArchivePublishedError) Unwrap() []error {
+	return []error{ErrArchivePublished, e.Err}
+}

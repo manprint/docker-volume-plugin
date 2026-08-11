@@ -10,16 +10,21 @@ import (
 
 var errDockerVolumeNotFound = errors.New("docker volume not found")
 
+const restoreOwnerLabel = "com.github.fabio.dvol.restore-owner"
+
 type dockerVolumeInfo struct {
 	Name       string
 	Driver     string
 	Mountpoint string
+	Options    map[string]string
+	Labels     map[string]string
 }
 
 type dockerVolumeClient interface {
 	List() ([]dockerVolumeInfo, error)
 	Inspect(name string) (dockerVolumeInfo, error)
-	Create(name string) (dockerVolumeInfo, error)
+	Create(name, restoreOwner string) (dockerVolumeInfo, error)
+	Remove(name string) error
 	// ContainersUsing returns the names of the running containers that have the
 	// volume mounted.
 	ContainersUsing(name string) ([]string, error)
@@ -84,11 +89,22 @@ func (c *dockerCLI) List() ([]dockerVolumeInfo, error) {
 	return volumes, nil
 }
 
-func (c *dockerCLI) Create(name string) (dockerVolumeInfo, error) {
-	if _, err := c.run("volume", "create", "--name", name); err != nil {
+func (c *dockerCLI) Create(name, restoreOwner string) (dockerVolumeInfo, error) {
+	if _, err := c.run("volume", "create", "--label", restoreOwnerLabel+"="+restoreOwner, "--name", name); err != nil {
 		return dockerVolumeInfo{}, err
 	}
 	return c.Inspect(name)
+}
+
+func (c *dockerCLI) Remove(name string) error {
+	if _, err := c.run("volume", "rm", name); err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such volume") || strings.Contains(msg, "not found") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // ContainersUsing lists the running containers that mount the volume. Restoring

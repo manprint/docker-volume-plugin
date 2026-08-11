@@ -16,6 +16,9 @@ readonly ARCHIVE_ROOT="$WORK_DIR/archives"
 readonly ODOO_COMPOSE="$SCRIPT_DIR/acceptance/odoo-compose.yaml"
 readonly DVOL_BIN="${DVOL_BIN:-$PROJECT_ROOT/bin/dvol-cli-plugin}"
 readonly DVOL_MODE="${DVOL_MODE:-direct}"
+readonly POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16.14-bookworm}"
+readonly ODOO_IMAGE="${ODOO_IMAGE:-odoo:17.0-20260723}"
+export POSTGRES_IMAGE ODOO_IMAGE
 
 dvol_cmd() {
 	case "$DVOL_MODE" in
@@ -215,7 +218,7 @@ run_postgres_scenario() {
 		-e POSTGRES_PASSWORD=acceptance \
 		-e POSTGRES_DB=acceptance \
 		-v "$volume:/var/lib/postgresql/data" \
-		postgres:16 >/dev/null
+		"$POSTGRES_IMAGE" >/dev/null
 	CREATED_CONTAINERS+=("$container")
 	wait_for "PostgreSQL readiness" docker exec "$container" pg_isready -U postgres -d acceptance
 
@@ -244,7 +247,7 @@ run_postgres_scenario() {
 		-e POSTGRES_PASSWORD=acceptance \
 		-e POSTGRES_DB=acceptance \
 		-v "$volume:/var/lib/postgresql/data" \
-		postgres:16 >/dev/null
+		"$POSTGRES_IMAGE" >/dev/null
 	wait_for "restored PostgreSQL readiness" docker exec "$container" pg_isready -U postgres -d acceptance
 	assert_pg_data "$container" "$expected"
 }
@@ -363,8 +366,8 @@ main() {
 	fi
 
 	mkdir -p -- "$ARCHIVE_ROOT"
-	require_image postgres:16
-	require_image odoo:17.0
+	require_image "$POSTGRES_IMAGE"
+	require_image "$ODOO_IMAGE"
 
 	for compression in gzip xz zstd lz4; do
 		run_postgres_scenario "$compression"

@@ -1,6 +1,7 @@
 package dvol
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,6 +49,19 @@ func TestCreateGetListRemove(t *testing.T) {
 	}
 	if _, err := s.Get("data"); err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestLegacyListReportsMissingVolumeData(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Create("dangling", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(s.VolumePath("dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("List hid inconsistent legacy volume state: %v", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package dvol
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,15 +41,24 @@ func LoadComposeFile(path, projectOverride string) (*ComposeFile, error) {
 	}
 
 	cf := &ComposeFile{}
+	project, source := "", ""
 	if n, ok := root["name"].(string); ok && n != "" {
-		cf.Project = normalizeProject(n)
+		project, source = n, "top-level name"
+	}
+	if envProject := os.Getenv("COMPOSE_PROJECT_NAME"); envProject != "" {
+		project, source = envProject, "COMPOSE_PROJECT_NAME"
 	}
 	if projectOverride != "" {
-		cf.Project = normalizeProject(projectOverride)
+		project, source = projectOverride, "-p/--project-name"
 	}
-	if cf.Project == "" {
-		cf.Project = defaultProject(path)
+	if project == "" {
+		project = defaultProject(path)
+		source = "compose file directory"
 	}
+	if err := validateProject(project); err != nil {
+		return nil, fmt.Errorf("invalid Compose project from %s: %w", source, err)
+	}
+	cf.Project = project
 
 	raw, _ := root["volumes"].(map[string]any)
 	keys := make([]string, 0, len(raw))
@@ -66,30 +76,32 @@ func LoadComposeFile(path, projectOverride string) (*ComposeFile, error) {
 	return cf, nil
 }
 
-// defaultProject derives the project name from the compose file directory,
-// mirroring docker compose: the lowercased basename with invalid characters
-// replaced by "-".
+// defaultProject derives a valid project name from the Compose file directory.
+// Explicit names are validated rather than silently rewritten.
 func defaultProject(path string) string {
 	dir := filepath.Dir(path)
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
-	return normalizeProject(filepath.Base(dir))
+	return normalizeDefaultProject(filepath.Base(dir))
 }
 
-// projectCharRe matches characters docker compose strips from project names.
-var projectCharRe = regexp.MustCompile(`[^a-z0-9_.-]+`)
+var (
+	projectNameRe    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	projectInvalidRe = regexp.MustCompile(`[^a-z0-9_-]+`)
+)
 
-// normalizeProject lowercases the name and replaces invalid characters with
-// "-", mirroring docker compose's own normalization of `name:` and -p values
-// so derived volume names match the ones docker actually creates.
-func normalizeProject(p string) string {
+func validateProject(p string) error {
+	if !projectNameRe.MatchString(p) {
+		return fmt.Errorf("project name %q must start with a lowercase letter or digit and contain only lowercase letters, digits, dashes and underscores", p)
+	}
+	return nil
+}
+
+func normalizeDefaultProject(p string) string {
 	p = strings.ToLower(p)
-	p = projectCharRe.ReplaceAllString(p, "-")
-	// docker compose requires a project name to start with a letter or a digit.
-	// Keeping a leading "." or "-" here would also produce a hidden bundle file
-	// named after the project.
-	p = strings.TrimLeft(p, ".-_")
+	p = projectInvalidRe.ReplaceAllString(p, "")
+	p = strings.TrimLeft(p, "-_")
 	if p == "" {
 		p = "default"
 	}

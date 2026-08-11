@@ -106,7 +106,11 @@ release blocker, not a style question.
 
 10. The live target is replaced only after the complete stream has been
     extracted and validated. A corrupt, truncated or hostile archive leaves the
-    volume byte-identical. `TestRestoreFailureNeverModifiesVolume`.
+    volume byte-identical. Bundle publication has one journalled group commit:
+    a failed swap or crash rolls every target back or completes every target,
+    never a mixed generation. `TestRestoreFailureNeverModifiesVolume`,
+    `TestBundlePublicationFailureRollsBackEveryVolume`,
+    `TestReplacementGroupCrashRecoveryIsAllOrNothing`.
 11. No archive entry escapes the volume root: absolute paths, `..`, symlinked
     ancestors, hard links pointing outside and a symlink at the volume root are
     all refused. `TestRestoreRejectsZipSlip`, `TestRestoreRejectsSymlinkEscape`,
@@ -114,14 +118,19 @@ release blocker, not a style question.
 12. A restore reproduces the source exactly: content, mode incl. setuid/setgid/
     sticky, owner, nanosecond mtime, symlinks, hard-link *grouping*, FIFOs,
     xattrs (hence POSIX ACLs and capabilities) and holes in sparse files.
-    `fidelity_test.go`.
+    Metadata recreation is strict by default; `BestEffortMetadata`/
+    `--best-effort-metadata` is the only explicit downgrade. `fidelity_test.go`,
+    `TestStrictMetadataFailureNeverPublishesPartialRestore`.
 13. Metadata is only ever applied to entries that were actually created.
     `TestFifoRoundTrip`, `TestRestoreSkipsDeviceNodeWithoutPrivileges`.
 14. Every directory swap is journalled, so a crash inside the one non-atomic
     window is repaired by the next `NewStore` — for any target, including a
-    Docker mountpoint outside the repository. `journal_test.go`.
+    Docker mountpoint outside the repository. Journal creation/removal and the
+    extracted filesystem are synced before publication. `journal_test.go`.
 15. A restore into a volume a running container has mounted is refused unless
-    `--force`. `TestRestoreRefusesVolumeMountedByRunningContainer`.
+    `--force`; the CLI checks both before staging and immediately before commit.
+    `TestRestoreRefusesVolumeMountedByRunningContainer`,
+    `TestRestoreRechecksRunningContainersImmediatelyBeforeCommit`.
 
 **Metadata**
 
@@ -132,6 +141,13 @@ release blocker, not a style question.
     an archive write; an archive name is owned through a flocked reservation
     file; journal records are flocked so recovery skips in-flight operations.
     `concurrency_test.go`, run under `-race`.
+18. CLI operations accept plain Docker `local` volumes and local bind-backed
+    volumes with `type=none`, an absolute `device`, and `o=bind[,rw]`. Bind
+    volumes resolve to the host device rather than Docker's transient `_data`
+    mount. Remote daemons, Docker Desktop mountpoints, third-party drivers and
+    NFS/CIFS-style `local` options are outside the data-path contract and are
+    rejected. `TestVolumeSourceSupportsLocalBindDriverOptions`,
+    `TestVolumeSourceRejectsUnsupportedOrRemoteDrivers`.
 
 ## Quality gates
 
@@ -195,3 +211,6 @@ Rules for new work:
   `--allow-atime` plus read permission.
 - Backing up a live volume is crash-consistent per file, not point-in-time.
   Quiesce the containers when the application needs a coherent snapshot.
+- The supported operational platform is a local Linux Docker Engine with plain
+  `local` volumes. Docker CLI plugin discovery starts at Docker CLI 19.03, but
+  discovery compatibility does not certify a daemon/filesystem combination.

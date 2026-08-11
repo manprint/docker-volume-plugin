@@ -203,6 +203,38 @@ func TestBundleRestoreRejectsDuplicatePhysicalTargets(t *testing.T) {
 	assertTreeUnchanged(t, target, "duplicate restore target", before, snapshotTree(t, target))
 }
 
+func TestBundlePublicationFailureRollsBackEveryVolume(t *testing.T) {
+	s := newTestStore(t)
+	archive := craftBundleTar(t, []string{"app", "db"}, []tarItem{
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "app/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("new-app")},
+		{hdr: tar.Header{Name: "db/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "db/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("new-db")},
+	})
+	targets := map[string]string{"app": t.TempDir(), "db": t.TempDir()}
+	before := map[string]map[string]treeNode{}
+	for name, target := range targets {
+		writeVolumeFile(t, target, "live.txt", "old-"+name)
+		before[name] = snapshotTree(t, target)
+	}
+	renames := 0
+	s.replaceRename = func(oldPath, newPath string) error {
+		renames++
+		if renames == 4 {
+			return errors.New("injected second-volume publication failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}
+
+	err := s.RestoreBundleSources(archive, targets)
+	if err == nil || !strings.Contains(err.Error(), "injected second-volume") {
+		t.Fatalf("expected the second publication to fail, got %v", err)
+	}
+	for name, target := range targets {
+		assertTreeUnchanged(t, target, name+" after group rollback", before[name], snapshotTree(t, target))
+	}
+}
+
 func TestOversizedBundleManifestCannotBypassArchiveKindCheck(t *testing.T) {
 	s := newTestStore(t)
 	manifest := []byte(`{"format":"` + bundleFormat + `","volumes":["app"],"padding":"` + strings.Repeat("x", manifestProbeLimit) + `"}`)
@@ -219,6 +251,49 @@ func TestOversizedBundleManifestCannotBypassArchiveKindCheck(t *testing.T) {
 		t.Fatalf("oversized bundle manifest must be refused, got %v", err)
 	}
 	assertTreeUnchanged(t, target, "oversized manifest", before, snapshotTree(t, target))
+}
+
+func TestNonCanonicalBundleManifestCannotBypassArchiveKindCheck(t *testing.T) {
+	s := newTestStore(t)
+	manifest, err := json.Marshal(bundleManifest{
+		Format: bundleFormat, Created: time.Now().UTC(), Volumes: []string{"app"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := craftTar(t, []tarItem{
+		{hdr: tar.Header{Name: "././" + bundleManifestName, Typeflag: tar.TypeReg, Mode: 0o644}, data: manifest},
+		{hdr: tar.Header{Name: "app/", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "app/data", Typeflag: tar.TypeReg, Mode: 0o644}, data: []byte("bundle-data")},
+	})
+
+	for _, tc := range []struct {
+		name    string
+		restore func(string) error
+	}{
+		{name: "file", restore: func(target string) error {
+			return s.RestoreSource("victim", target, archive)
+		}},
+		{name: "stream", restore: func(target string) error {
+			f, err := os.Open(archive)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			return s.RestoreSourceReader("victim", target, f)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := t.TempDir()
+			writeVolumeFile(t, target, "live.txt", "keep")
+			before := snapshotTree(t, target)
+			err := tc.restore(target)
+			if !errors.Is(err, ErrBundleArchive) {
+				t.Fatalf("non-canonical bundle manifest must be refused, got %v", err)
+			}
+			assertTreeUnchanged(t, target, "non-canonical manifest", before, snapshotTree(t, target))
+		})
+	}
 }
 
 // A volume may legitimately hold its own manifest.json; only dvol's own bundle
@@ -327,6 +402,32 @@ func TestCopyFileEntryTruncatesGrowingFile(t *testing.T) {
 	}
 	if err := tw.Close(); err != nil {
 		t.Fatalf("archive not consistent after truncation: %v", err)
+	}
+}
+
+// TestBackupTraversalReadsDirectoriesInBoundedBatches locks out both the old
+// unbounded allocation and the easy replacement bug where only the first batch
+// was visited.
+func TestBackupTraversalReadsDirectoriesInBoundedBatches(t *testing.T) {
+	s := newTestStore(t)
+	source := t.TempDir()
+	want := directoryReadBatchSize + 17
+	for i := 0; i < want; i++ {
+		name := filepath.Join(source, fmt.Sprintf("entry-%05d", i))
+		if err := os.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := 0
+	if err := walkReadOnly(source, s.readOptions(), func(readOnlyTreeEntry) error {
+		got++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("visited %d entries, want %d (all batches)", got, want)
 	}
 }
 
@@ -469,6 +570,7 @@ func TestFifoRoundTrip(t *testing.T) {
 
 func TestRestoreSkipsDeviceNodeWithoutPrivileges(t *testing.T) {
 	s := newTestStore(t)
+	s.cfg.BestEffortMetadata = true
 	if err := s.Create("dev", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -485,6 +587,35 @@ func TestRestoreSkipsDeviceNodeWithoutPrivileges(t *testing.T) {
 	}
 }
 
+func TestStrictMetadataFailureNeverPublishesPartialRestore(t *testing.T) {
+	s := newTestStore(t)
+	archive := craftTar(t, []tarItem{
+		{hdr: tar.Header{Name: ".", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{
+			Name: "data.txt", Typeflag: tar.TypeReg, Mode: 0o644,
+			PAXRecords: map[string]string{xattrPAXPrefix + "invalid/name": "value"},
+		}, data: []byte("new")},
+	})
+	target := t.TempDir()
+	writeVolumeFile(t, target, "live.txt", "keep")
+	before := snapshotTree(t, target)
+
+	err := s.RestoreSource("strict", target, archive)
+	if err == nil || !strings.Contains(err.Error(), "extended attribute") {
+		t.Fatalf("strict metadata restore must fail, got %v", err)
+	}
+	assertTreeUnchanged(t, target, "strict metadata failure", before, snapshotTree(t, target))
+
+	s.cfg.BestEffortMetadata = true
+	bestEffortTarget := t.TempDir()
+	if err := s.RestoreSource("best-effort", bestEffortTarget, archive); err != nil {
+		t.Fatalf("explicit best-effort restore failed: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(bestEffortTarget, "data.txt")); err != nil || string(got) != "new" {
+		t.Fatalf("best-effort restore lost file data: %q err=%v", got, err)
+	}
+}
+
 func TestRestoreRejectsOverflowingDeviceNumbers(t *testing.T) {
 	base := t.TempDir()
 	for _, hdr := range []tar.Header{
@@ -492,7 +623,7 @@ func TestRestoreRejectsOverflowingDeviceNumbers(t *testing.T) {
 		{Name: "overflow", Typeflag: tar.TypeBlock, Mode: 0o600, Devmajor: 1, Devminor: 1 << 32},
 	} {
 		target := filepath.Join(base, hdr.Name)
-		_, err := extractEntry(&hdr, bytes.NewReader(nil), target, base, nil, nil)
+		_, err := extractEntry(&hdr, bytes.NewReader(nil), target, base, nil, nil, true)
 		if err == nil || !strings.Contains(err.Error(), "invalid device numbers") {
 			t.Fatalf("invalid device header %+v was accepted: %v", hdr, err)
 		}
@@ -1033,6 +1164,55 @@ func TestTemporaryArchiveStaysPrivateUntilPublication(t *testing.T) {
 	}
 	if info, err := os.Stat(final); err != nil || info.Mode().Perm() != 0o644 {
 		t.Fatalf("published archive mode: info=%v err=%v", info, err)
+	}
+}
+
+func TestLatePublicationFailureReportsCompletedArchivePath(t *testing.T) {
+	injected := errors.New("injected late durability failure")
+	tests := []struct {
+		name string
+		ops  archivePublicationOps
+	}{
+		{
+			name: "close",
+			ops: archivePublicationOps{
+				close: func(f *os.File) error {
+					if err := f.Close(); err != nil {
+						return err
+					}
+					return injected
+				},
+				syncDir: syncDir,
+			},
+		},
+		{
+			name: "directory sync",
+			ops: archivePublicationOps{
+				close: (*os.File).Close,
+				syncDir: func(string) error {
+					return injected
+				},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			final := filepath.Join(t.TempDir(), "published.tar.gz")
+			err := writeArchiveWithProgressOps(final, 0o644, BackupOptions{}, nil, func(*tar.Writer) error {
+				return nil
+			}, tc.ops)
+			if !errors.Is(err, ErrArchivePublished) || !errors.Is(err, injected) {
+				t.Fatalf("late failure classification: %v", err)
+			}
+			var published *ArchivePublishedError
+			if !errors.As(err, &published) || published.Path != final {
+				t.Fatalf("published path missing from error: %#v", err)
+			}
+			if info, statErr := os.Stat(final); statErr != nil || info.Size() == 0 {
+				t.Fatalf("completed archive is not present: info=%v err=%v", info, statErr)
+			}
+		})
 	}
 }
 

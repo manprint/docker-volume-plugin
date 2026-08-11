@@ -42,7 +42,7 @@ docker run -d \
   -e MONGO_INITDB_ROOT_PASSWORD=changeme \
   -v mongo_data:/data/db \
   -v mongo_logs:/var/log/mongodb \
-  mongo:7 \
+  "${MONGO_IMAGE:-mongo:7.0.39-jammy}" \
   mongod --logpath /var/log/mongodb/mongod.log
  
 echo "MongoDB avviato correttamente."

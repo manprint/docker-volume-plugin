@@ -8,6 +8,7 @@ import (
 
 func writeTemp(t *testing.T, content string) string {
 	t.Helper()
+	t.Setenv("COMPOSE_PROJECT_NAME", "")
 	p := filepath.Join(t.TempDir(), "compose.yaml")
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -77,31 +78,38 @@ func TestDefaultProjectFromDir(t *testing.T) {
 	}
 }
 
-func TestProjectNameNormalized(t *testing.T) {
+func TestInvalidTopLevelProjectNameIsRejected(t *testing.T) {
 	p := writeTemp(t, "name: My Proj!\nvolumes:\n  data:\n")
+	if _, err := LoadComposeFile(p, ""); err == nil {
+		t.Fatal("invalid top-level Compose project name was silently normalized")
+	}
+}
+
+func TestInvalidProjectOverrideIsRejected(t *testing.T) {
+	p := writeTemp(t, "volumes:\n  data:\n")
+	if _, err := LoadComposeFile(p, "UPPER CASE"); err == nil {
+		t.Fatal("invalid -p project name was silently normalized")
+	}
+	if _, err := LoadComposeFile(p, "has.dot"); err == nil {
+		t.Fatal("project name containing a dot was accepted")
+	}
+}
+
+func TestComposeProjectPrecedenceIncludesEnvironment(t *testing.T) {
+	p := writeTemp(t, "name: from-file\nvolumes:\n  data:\n")
+	t.Setenv("COMPOSE_PROJECT_NAME", "from-env")
 	cf, err := LoadComposeFile(p, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// docker compose lowercases and replaces invalid chars with "-"
-	if cf.Project != "my-proj-" {
-		t.Fatalf("project=%q", cf.Project)
+	if cf.Project != "from-env" || cf.Volumes[0].Name != "from-env_data" {
+		t.Fatalf("environment project was not applied: %+v", cf)
 	}
-	if len(cf.Volumes) != 1 || cf.Volumes[0].Name != "my-proj-_data" {
-		t.Fatalf("volumes=%+v", cf.Volumes)
-	}
-}
-
-func TestProjectOverrideNormalized(t *testing.T) {
-	p := writeTemp(t, "volumes:\n  data:\n")
-	cf, err := LoadComposeFile(p, "UPPER CASE")
+	cf, err = LoadComposeFile(p, "from-flag")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cf.Project != "upper-case" {
-		t.Fatalf("project=%q", cf.Project)
-	}
-	if len(cf.Volumes) != 1 || cf.Volumes[0].Name != "upper-case_data" {
-		t.Fatalf("volumes=%+v", cf.Volumes)
+	if cf.Project != "from-flag" || cf.Volumes[0].Name != "from-flag_data" {
+		t.Fatalf("-p did not override environment: %+v", cf)
 	}
 }

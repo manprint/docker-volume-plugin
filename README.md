@@ -1,8 +1,8 @@
 # Docker Volume Backup
 
 `docker dvol` è un’estensione del client Docker per eseguire backup e restore
-dei volumi Docker. Usa il mountpoint reale del volume: non servono volumi
-speciali, driver dedicati o copie manuali dei dati.
+dei volumi Docker. Usa il mountpoint reale del volume: non installa un volume
+driver e non copia i dati fuori da Docker durante il normale funzionamento.
 
 ```bash
 docker volume create app
@@ -15,13 +15,49 @@ volumi creati prima dell’installazione.
 
 ## Requisiti
 
-- Docker Engine e il comando `docker` sull’host che esegue il comando;
+- Linux, Docker Engine locale e Docker CLI 19.03 o superiore sull’host che
+  esegue il comando;
 - Go 1.26.2 o superiore per compilare il progetto;
 - permessi di lettura/scrittura sul mountpoint Docker;
+- volumi con driver `local` normali oppure bind-backed con opzioni
+  `type=none`, `device=<percorso assoluto>`, `o=bind` (è ammesso anche `rw`);
 - container fermi o quiescenti durante il backup, se serve una fotografia coerente.
 
 Il comando deve essere eseguito sul nodo del Docker daemon. Con un daemon
-remoto o Docker Desktop, il mountpoint può trovarsi su un altro sistema.
+remoto o Docker Desktop, il mountpoint si trova altrove: il plugin può essere
+scoperto dal client, ma backup e restore vengono rifiutati o non sono
+supportati. I volumi bind-backed locali sono risolti al loro `device` host;
+volumi NFS/CIFS creati tramite opzioni del driver `local` e driver di terze
+parti sono invece rifiutati.
+
+### Compatibilità Docker CLI
+
+L’installabilità come `docker dvol` dipende dalla versione del **client**. Le
+operazioni sui volumi dipendono invece dal daemon locale Linux e dai requisiti
+appena elencati. Docker ha introdotto il framework dei CLI plugin nella serie
+[19.03](https://docs.docker.com/engine/release-notes/19.03/); il contratto
+metadata `0.1.0` usato da dvol è presente nel
+[sorgente docker/cli 19.03.15](https://github.com/docker/cli/blob/v19.03.15/cli-plugins/manager/plugin.go).
+
+| Docker CLI | Installabile come `docker dvol` | Stato |
+| --- | --- | --- |
+| 29.x | Sì | Discovery, help, E2E, streaming e acceptance applicativa/MongoDB verificati con CLI ed Engine 29.7.2. |
+| 28.x | Sì | Compatibilità tecnica del contratto plugin; non certificato in QA. |
+| 27.x | Sì | Compatibilità tecnica; non certificato in QA. |
+| 26.x | Sì | Compatibilità tecnica; non certificato in QA. |
+| 25.x | Sì | Compatibilità tecnica; non certificato in QA. |
+| 24.x | Sì | Compatibilità tecnica; non certificato in QA. |
+| 23.x | Sì | Compatibilità tecnica; non certificato in QA. |
+| 20.10.x | Sì | Compatibilità tecnica storica; non certificato in QA. |
+| 19.03.x | **Sì, minimo tecnico** | Discovery e help verificati a runtime con `docker:19.03.15`; data path su daemon storico non certificato. |
+| 18.09.x | No | Verifica runtime negativa con `docker:18.09.9`: `dvol` non viene scoperto. |
+| 18.06.x e precedenti | No | Non supportato. |
+
+La tabella riguarda discovery e installazione, non certifica ogni combinazione
+client/Engine/filesystem. Docker non ha pubblicato serie Engine stabili 21.x e
+22.x; per questo la cronologia passa da 20.10 a 23.x. La matrice QA richiesta è
+CLI 19.03.15 e corrente, Engine storico concordato e corrente, linux/amd64 e
+linux/arm64, ext4 e XFS, con volumi `local` normali e bind-backed.
 
 ## Installazione
 
@@ -48,7 +84,8 @@ docker volume create app
 ## Volumi esistenti e nuovi
 
 `docker dvol` interroga Docker e usa il mountpoint restituito da
-`docker volume inspect`:
+`docker volume inspect`; per un volume bind-backed supportato usa invece il
+percorso assoluto dell'opzione `device`:
 
 ```bash
 docker volume ls
@@ -58,7 +95,17 @@ docker dvol backup existing-data
 
 Se il volume di destinazione non esiste durante un restore, viene creato
 automaticamente con `docker volume create --name <nome>` e il backup viene
-ripristinato nel suo mountpoint. Il volume rimane un volume Docker `local`.
+ripristinato nel suo mountpoint. Il volume rimane un volume Docker `local`. Se
+il restore fallisce, dvol rimuove il volume creato dall’operazione soltanto se è
+ancora vuoto, non montato e con lo stesso mountpoint; dati comparsi nel frattempo
+non vengono cancellati. Un’etichetta univoca
+`com.github.fabio.dvol.restore-owner` distingue la creazione di questa sessione
+da una creazione concorrente; resta sul volume dopo un restore riuscito come
+traccia di provenienza.
+
+Gli archivi non contengono la configurazione del driver Docker. Se un volume
+bind-backed non esiste più, ricrearlo con le sue opzioni `type/device/o` prima
+del restore; altrimenti dvol crea volutamente un normale volume `local`.
 
 ```bash
 docker volume inspect app \
@@ -92,6 +139,11 @@ docker volume inspect app \
     consente di leggere sorgenti che non possono essere aperte con O_NOATIME
     (file di un altro utente senza privilegi di root, alcuni mount NFS);
     default: il backup fallisce invece di aggiornare gli atime della sorgente
+
+--best-effort-metadata
+    durante il restore, registra un warning e continua se non può ricreare
+    xattr, ACL, capability, FIFO o device; default sicuro: il restore fallisce
+    e non pubblica alcun risultato incompleto
 ```
 
 Le opzioni globali possono precedere o seguire il sottocomando. Dopo `--` non
@@ -417,7 +469,10 @@ data. Stop them first, or pass --force
 Fermare i container, oppure usare `--force` accettandone le conseguenze.
 Se Docker non riesce a determinare se il volume è in uso, il restore fallisce
 allo stesso modo; `--force` è l’unico opt-in che permette di procedere senza
-questa verifica.
+questa verifica. Il controllo viene eseguito sia prima dello staging sia subito
+prima del commit, per ridurre la finestra in cui un container potrebbe montare
+il volume durante un restore lungo. Non è un lock Docker: la procedura operativa
+resta fermare o quiescere esplicitamente i workload.
 
 ### Archivi singoli e bundle non sono intercambiabili
 
@@ -523,10 +578,10 @@ docker dvol compose-backup -f compose.yaml
 Comandi:
 
 ```text
-compose-backup [-f <file>] [-p <project>] [--stdout] [--compression <formato>]
+compose-backup [-f <file>] [-p|--project-name <project>] [--stdout] [--compression <formato>]
                [--level <n>] [--threads <n>] [--archive-name <nome>]
                [--timestamp] [--timestamp-utc] [--overwrite] [--skip-missing]
-compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [--strict]
+compose-restore [-f <file>] [-p|--project-name <project>] [--stdin] [--spool] [--strict]
                 [--force] [<archivio>]
 ```
 
@@ -534,6 +589,12 @@ compose-restore [-f <file>] [-p <project>] [--stdin] [--spool] [--strict]
 Inoltre legge il YAML letterale e non espande variabili d'ambiente o profili.
 Per più file o configurazioni interpolate, generare prima il risultato con
 `docker compose ... config` e passare quel file a dvol.
+
+Il nome progetto segue questa precedenza, dalla più forte: `-p`/
+`--project-name`, `COMPOSE_PROJECT_NAME`, campo top-level `name:`, nome della
+directory del Compose file. I primi tre valori devono già rispettare
+`[a-z0-9][a-z0-9_-]*` e vengono rifiutati se non validi; soltanto il fallback
+derivato dalla directory viene normalizzato in minuscolo.
 
 Se un volume dichiarato nel compose file non esiste in Docker, `compose-backup`
 si ferma: un bundle che contiene solo una parte del progetto è indistinguibile
@@ -551,7 +612,9 @@ Simmetricamente, `compose-restore` accetta per default un bundle che non
 contiene tutti i volumi dichiarati: ripristina quelli presenti e avvisa sugli
 altri, che restano intatti. Con `--strict` un bundle incompleto è un errore. In
 entrambi i casi i volumi Docker mancanti vengono creati **solo dopo** che il
-manifest è stato letto e accettato: un restore rifiutato non lascia volumi vuoti.
+manifest è stato letto e accettato. Se una fase successiva fallisce, i volumi
+creati dall’operazione vengono rimossi con le salvaguardie descritte sopra: un
+restore rifiutato non lascia volumi vuoti.
 
 Il bundle viene scritto in `backups/compose/`, contiene `manifest.json` e una
 directory per ogni volume. Durante il restore i volumi mancanti vengono creati
@@ -570,8 +633,11 @@ ricerca riconosce sia il nome predefinito `<progetto>-<timestamp>` sia quello
 prodotto da `--timestamp` (`<progetto>_ddmmyyyy_HHMMSS`); un bundle rinominato
 con `--archive-name` viene individuato leggendo il suo `manifest.json`.
 
-Tutti gli staging vengono preparati prima degli swap; ogni volume viene
-sostituito atomicamente e indipendentemente dagli altri.
+Tutti gli staging vengono preparati e sincronizzati prima degli swap. Il bundle
+ha un unico punto di commit journalizzato: se qualunque swap fallisce prima del
+commit, tutti i volumi già sostituiti vengono riportati allo stato precedente;
+dopo un crash, il recupero completa o annulla l’intero gruppo senza esporre un
+bundle metà vecchio e metà nuovo.
 
 `compose-backup --stdout` produce sempre un bundle unico, adatto a rclone:
 
@@ -655,8 +721,11 @@ tronterebbe i timestamp al secondo.
 Limiti noti: `archive/tar` non sa scrivere estensioni sparse, quindi l’archivio
 di un file sparso è grande quanto la sua dimensione apparente (i buchi vengono
 ricreati durante il restore); il ripristino di proprietario, device e attributi
-`security.*`/`system.*` richiede i privilegi corrispondenti, e in loro assenza
-viene emesso un avviso senza interrompere il restore.
+`security.*`/`system.*` richiede i privilegi corrispondenti. Il default è
+stretto: se FIFO, device, xattr, ACL o capability non possono essere ricreati,
+il restore fallisce e il volume live resta invariato. Solo l’opt-in globale
+`--best-effort-metadata` converte questi errori in warning e permette un restore
+consapevolmente non fedele.
 
 In caso di crash durante il backup:
 
@@ -664,6 +733,12 @@ In caso di crash durante il backup:
 - un archivio temporaneo incompleto non viene pubblicato;
 - gli archivi già pubblicati restano validi;
 - il file temporaneo abbandonato viene rimosso al backup successivo.
+
+Se il file finale è già visibile ma il `close` o la sincronizzazione della
+directory falliscono, l’errore riporta esplicitamente il percorso come
+“published but durability confirmation failed”. Non ripetere alla cieca:
+eseguire `docker dvol verify --archive <percorso>` prima di decidere se rifare il
+backup.
 
 La destinazione dell’archivio deve essere esterna a tutti i volumi sorgente.
 Questo comando viene rifiutato prima di creare file:
@@ -691,7 +766,9 @@ interrotte: se la nuova directory era già stata pubblicata rimuove la copia
 vecchia, altrimenti rimette al suo posto quella precedente, e in ogni caso
 elimina lo staging rimasto. Il journal copre qualunque destinazione, compresi i
 mountpoint Docker fuori dal repository, e i record ancora in uso da un altro
-processo vengono saltati: due comandi dvol contemporanei non si disturbano.
+processo vengono saltati: due comandi dvol contemporanei non si disturbano. I
+record dei bundle condividono inoltre un marker di commit durevole, così il
+recupero prende una sola decisione per l’intero gruppo.
 
 Il risultato è che il dato non può sparire: dopo un restore interrotto il volume
 contiene o il contenuto precedente o quello ripristinato, mai nulla.
@@ -761,8 +838,15 @@ Docker Engine operativo, permessi sui mountpoint dei volumi e può scaricare le
 immagini di test. Lo script rimuove al termine container, volumi, reti Compose,
 repository temporaneo e le immagini scaricate esclusivamente dalla suite.
 
+Le immagini applicative della acceptance hanno tag di patch fissati
+(`postgres:16.14-bookworm`, `mongo:7.0.39-jammy`,
+`odoo:17.0-20260723`, `rclone/rclone:1.74.2`); le variabili
+`POSTGRES_IMAGE`, `MONGO_IMAGE`, `ODOO_IMAGE` e `RCLONE_IMAGE` consentono una
+matrice esplicita senza reintrodurre tag mobili. Lo scenario fidelity richiede
+`getfattr` e fallisce se non riesce realmente a creare l’xattr di fixture.
+
 `make acceptance-stream` esegue la matrice stdin/stdout attraverso `docker
-dvol` e l’immagine Docker ufficiale `rclone/rclone:latest`, usando una directory
+dvol` e l’immagine Docker ufficiale `rclone/rclone:1.74.2`, usando una directory
 locale come remote filesystem. Verifica sul remote l’esistenza, la dimensione
 e la rilettura di ogni oggetto; quindi esegue restore diretto e `--spool` per
 backup singoli, bundle multi-volume e Compose, con tutte le compressioni. La
@@ -802,6 +886,15 @@ sullo stesso nome di archivio, listing durante un backup in corso, restore
 paralleli e recupero concorrente. `make acceptance-stream` ripete inoltre le
 verifiche di invariabilità sui volumi Docker reali durante backup singoli,
 bundle e Compose.
+
+### API Go legacy
+
+`Store.Create`, `Store.Get`, `Store.List`, `Store.Size`, `Store.Remove` e
+`Store.VolumePath` descrivono il vecchio modello di volumi gestiti dentro il
+repository e sono deprecati. La CLI non li usa per il lifecycle Docker: scopre
+i volumi con Docker e chiama le API `BackupSource*`/`RestoreSource*` sui
+mountpoint reali. `SizeWithError` resta disponibile agli embedder legacy e,
+diversamente da `Size`, non nasconde errori di traversal.
 
 ## Layout
 

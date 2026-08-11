@@ -9,6 +9,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,7 +29,7 @@ import (
 
 const (
 	pluginName    = "dvol"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 	metadataCmd   = "docker-cli-plugin-metadata"
 )
 
@@ -41,12 +43,13 @@ type app struct {
 
 // globalFlags are the options accepted before (and mixed with) a subcommand.
 type globalFlags struct {
-	root        string
-	backupDir   string
-	logLevel    string
-	allowAtime  bool
-	archiveMode string
-	rest        []string
+	root               string
+	backupDir          string
+	logLevel           string
+	allowAtime         bool
+	bestEffortMetadata bool
+	archiveMode        string
+	rest               []string
 }
 
 func main() {
@@ -87,11 +90,12 @@ func main() {
 		fail(err)
 	}
 	store, err := dvol.NewStore(dvol.Config{
-		Root:        root,
-		BackupsDir:  global.backupDir,
-		Logger:      cliLogger,
-		AllowAtime:  global.allowAtime,
-		ArchiveMode: archiveMode,
+		Root:               root,
+		BackupsDir:         global.backupDir,
+		Logger:             cliLogger,
+		AllowAtime:         global.allowAtime,
+		BestEffortMetadata: global.bestEffortMetadata,
+		ArchiveMode:        archiveMode,
 	})
 	if err != nil {
 		fail(err)
@@ -188,6 +192,8 @@ func extractGlobalFlags(args []string) globalFlags {
 			g.archiveMode = strings.TrimPrefix(a, "--archive-mode=")
 		case a == "--allow-atime":
 			g.allowAtime = true
+		case a == "--best-effort-metadata":
+			g.bestEffortMetadata = true
 		default:
 			g.rest = append(g.rest, a)
 		}
@@ -206,31 +212,84 @@ func (a *app) volumeSource(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return validateVolumeSource(name, info)
+}
+
+func validateVolumeSource(name string, info dockerVolumeInfo) (string, error) {
+	if info.Driver != "local" {
+		return "", fmt.Errorf("docker volume %q uses unsupported driver %q; dvol supports the local driver on the daemon host", name, info.Driver)
+	}
+	if len(info.Options) != 0 {
+		if source, ok := localBindVolumeSource(info.Options); ok {
+			return source, nil
+		}
+		return "", fmt.Errorf("docker volume %q uses unsupported local driver mount options; dvol supports plain local volumes and local bind volumes with type=none, device=<absolute path>, o=bind[,rw]", name)
+	}
 	if info.Mountpoint == "" {
 		return "", fmt.Errorf("docker volume %q has no usable mountpoint", name)
 	}
 	return info.Mountpoint, nil
 }
 
-// volumeTarget resolves the mountpoint of a volume, creating it if needed.
-func (a *app) volumeTarget(name string) (string, error) {
+// localBindVolumeSource recognizes the local driver's host-directory bind
+// form. Returning the device path (rather than Docker's transient _data mount)
+// keeps backup and restore correct even when Docker has not mounted the volume.
+func localBindVolumeSource(options map[string]string) (string, bool) {
+	if len(options) != 3 || options["type"] != "none" {
+		return "", false
+	}
+	device := options["device"]
+	if device == "" || !filepath.IsAbs(device) {
+		return "", false
+	}
+	seenBind := false
+	for _, option := range strings.Split(options["o"], ",") {
+		switch strings.TrimSpace(option) {
+		case "bind":
+			seenBind = true
+		case "rw":
+			// Docker may make the default read-write mode explicit.
+		default:
+			return "", false
+		}
+	}
+	if !seenBind {
+		return "", false
+	}
+	return filepath.Clean(device), true
+}
+
+// volumeTarget resolves the mountpoint of a volume, creating it if needed. The
+// owner label distinguishes a volume created by this restore from one created
+// concurrently after the initial inspect.
+func (a *app) volumeTarget(name, restoreOwner string) (target string, created bool, err error) {
 	if a.docker == nil {
-		return "", fmt.Errorf("docker CLI is required to resolve volume %q", name)
+		return "", false, fmt.Errorf("docker CLI is required to resolve volume %q", name)
 	}
 	source, err := a.volumeSource(name)
 	if errors.Is(err, errDockerVolumeNotFound) {
-		info, createErr := a.docker.Create(name)
+		info, createErr := a.docker.Create(name, restoreOwner)
 		if createErr != nil {
-			return "", fmt.Errorf("create Docker volume %q: %w", name, createErr)
+			return "", false, fmt.Errorf("create Docker volume %q: %w", name, createErr)
 		}
-		if info.Mountpoint == "" {
-			return "", fmt.Errorf("docker volume %q has no usable mountpoint", name)
+		created = info.Labels[restoreOwnerLabel] == restoreOwner
+		target, sourceErr := validateVolumeSource(name, info)
+		if sourceErr != nil {
+			if created {
+				_ = a.docker.Remove(name)
+			}
+			return "", false, sourceErr
 		}
-		return info.Mountpoint, nil
+		if created {
+			return target, true, nil
+		}
+		// Docker create is idempotent. A missing owner label means another actor
+		// won the inspect/create race, so this restore must treat it as existing.
+		return target, false, nil
 	} else if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return source, nil
+	return source, false, nil
 }
 
 // checkVolumeIdle refuses to replace a volume a running container has mounted.
@@ -262,26 +321,145 @@ func (a *app) checkVolumeIdle(name string, force bool) error {
 }
 
 func (a *app) restoreVolume(name, archive string, force bool) error {
-	if err := a.checkVolumeIdle(name, force); err != nil {
-		return err
-	}
-	target, err := a.volumeTarget(name)
+	targets := a.newRestoreTargets(force)
+	target, err := targets.Resolve(name)
 	if err != nil {
-		return err
+		return targets.finish(err)
 	}
-	return a.store.RestoreSource(name, target, archive)
+	return targets.finish(a.store.RestoreSourceWithOptions(name, target, archive,
+		dvol.RestoreOptions{BeforeCommit: targets.BeforeCommit}))
 }
 
-// volumeResolver returns a dvol resolver that creates missing Docker volumes.
-// It is called by the library only after a bundle manifest has been validated,
-// so a mismatching archive cannot leave stray empty volumes behind.
-func (a *app) volumeResolver(force bool) dvol.VolumeTargetResolver {
-	return func(name string) (string, error) {
-		if err := a.checkVolumeIdle(name, force); err != nil {
-			return "", err
-		}
-		return a.volumeTarget(name)
+type createdRestoreVolume struct {
+	name       string
+	mountpoint string
+	owner      string
+}
+
+// restoreTargets owns every Docker volume created while resolving one restore.
+// If extraction or publication fails it removes only volumes that are still
+// unused and empty. Existing volumes are never part of this rollback.
+type restoreTargets struct {
+	app     *app
+	force   bool
+	created []createdRestoreVolume
+	seen    map[string]bool
+	owner   string
+}
+
+func (a *app) newRestoreTargets(force bool) *restoreTargets {
+	return &restoreTargets{app: a, force: force, seen: map[string]bool{}, owner: newRestoreOwner()}
+}
+
+func newRestoreOwner() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err == nil {
+		return hex.EncodeToString(id[:])
 	}
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func (r *restoreTargets) Resolve(name string) (string, error) {
+	if err := r.app.checkVolumeIdle(name, r.force); err != nil {
+		return "", err
+	}
+	target, created, err := r.app.volumeTarget(name, r.owner)
+	if err != nil {
+		return "", err
+	}
+	if created && !r.seen[name] {
+		r.seen[name] = true
+		r.created = append(r.created, createdRestoreVolume{name: name, mountpoint: target, owner: r.owner})
+	}
+	return target, nil
+}
+
+func (r *restoreTargets) BeforeCommit(volumes []string) error {
+	if r.force {
+		return nil
+	}
+	for _, name := range volumes {
+		if err := r.app.checkVolumeIdle(name, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func emptyDirectory(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	_, err = f.Readdirnames(1)
+	if errors.Is(err, io.EOF) {
+		return true, nil
+	}
+	return false, err
+}
+
+func (r *restoreTargets) rollback() error {
+	var rollbackErr error
+	for i := len(r.created) - 1; i >= 0; i-- {
+		created := r.created[i]
+		containers, err := r.app.docker.ContainersUsing(created.name)
+		if err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("check created Docker volume %q before rollback: %w", created.name, err))
+			continue
+		}
+		if len(containers) != 0 {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("created Docker volume %q became mounted; leaving it in place", created.name))
+			continue
+		}
+		info, err := r.app.docker.Inspect(created.name)
+		if err != nil {
+			if errors.Is(err, errDockerVolumeNotFound) {
+				continue
+			}
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("inspect created Docker volume %q before rollback: %w", created.name, err))
+			continue
+		}
+		if info.Mountpoint != created.mountpoint {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("created Docker volume %q changed mountpoint; leaving it in place", created.name))
+			continue
+		}
+		if info.Labels[restoreOwnerLabel] != created.owner {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("created Docker volume %q no longer has this restore's owner label; leaving it in place", created.name))
+			continue
+		}
+		empty, err := emptyDirectory(created.mountpoint)
+		if err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("inspect created Docker volume %q contents: %w", created.name, err))
+			continue
+		}
+		if !empty {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("created Docker volume %q is no longer empty; leaving it in place", created.name))
+			continue
+		}
+		if err := r.app.docker.Remove(created.name); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove created Docker volume %q after failed restore: %w", created.name, err))
+		}
+	}
+	return rollbackErr
+}
+
+func (r *restoreTargets) finish(restoreErr error) error {
+	if restoreErr == nil {
+		return nil
+	}
+	if rollbackErr := r.rollback(); rollbackErr != nil {
+		return errors.Join(restoreErr, rollbackErr)
+	}
+	return restoreErr
+}
+
+func (a *app) restoreBundle(force bool, restore func(dvol.VolumeTargetResolver, func([]string) error) error) error {
+	targets := a.newRestoreTargets(force)
+	return targets.finish(restore(targets.Resolve, targets.BeforeCommit))
 }
 
 // cmdList: docker dvol list
@@ -551,17 +729,19 @@ func (a *app) cmdRestore(args []string) {
 		defer cleanup()
 		var err error
 		if *bundle {
-			err = a.store.RestoreBundleReader(input,
-				dvol.RestoreOptions{Volumes: names, AllowMissing: *allowMissing},
-				a.volumeResolver(*force))
+			err = a.restoreBundle(*force, func(resolve dvol.VolumeTargetResolver, beforeCommit func([]string) error) error {
+				return a.store.RestoreBundleReader(input,
+					dvol.RestoreOptions{Volumes: names, AllowMissing: *allowMissing, BeforeCommit: beforeCommit}, resolve)
+			})
 		} else {
 			name := names[0]
-			if err = a.checkVolumeIdle(name, *force); err == nil {
-				var target string
-				if target, err = a.volumeTarget(name); err == nil {
-					err = a.store.RestoreSourceReader(name, target, input)
-				}
+			targets := a.newRestoreTargets(*force)
+			var target string
+			if target, err = targets.Resolve(name); err == nil {
+				err = a.store.RestoreSourceReaderWithOptions(name, target, input,
+					dvol.RestoreOptions{BeforeCommit: targets.BeforeCommit})
 			}
+			err = targets.finish(err)
 		}
 		if err != nil {
 			fail(err)
@@ -586,9 +766,10 @@ func (a *app) cmdRestore(args []string) {
 		if err := checkDuplicates(names); err != nil {
 			fail(err)
 		}
-		if err := a.store.RestoreBundleTargets(archive,
-			dvol.RestoreOptions{Volumes: names, AllowMissing: *allowMissing},
-			a.volumeResolver(*force)); err != nil {
+		if err := a.restoreBundle(*force, func(resolve dvol.VolumeTargetResolver, beforeCommit func([]string) error) error {
+			return a.store.RestoreBundleTargets(archive,
+				dvol.RestoreOptions{Volumes: names, AllowMissing: *allowMissing, BeforeCommit: beforeCommit}, resolve)
+		}); err != nil {
 			fail(err)
 		}
 		fmt.Fprintf(os.Stderr, "restored %d volume(s) from %s\n", len(names), archive)
@@ -669,7 +850,9 @@ func (a *app) restoreLatest(name string, force bool) error {
 func (a *app) cmdComposeBackup(args []string) {
 	fs := flag.NewFlagSet("compose-backup", flag.ContinueOnError)
 	var files multiFlag
-	project := fs.String("p", "", "project name")
+	project := ""
+	fs.StringVar(&project, "p", "", "project name")
+	fs.StringVar(&project, "project-name", "", "project name")
 	comp := fs.String("compression", "gzip", "compression format: gzip, xz, zstd or lz4")
 	level := fs.Int("level", 0, "compression level (0 = balanced default)")
 	threads := fs.Int("threads", 0, "compression threads (0 = half of CPU count; xz uses one)")
@@ -700,7 +883,7 @@ func (a *app) cmdComposeBackup(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	cf, err := dvol.LoadComposeFile(path, *project)
+	cf, err := dvol.LoadComposeFile(path, project)
 	if err != nil {
 		fail(err)
 	}
@@ -748,7 +931,9 @@ func (a *app) cmdComposeBackup(args []string) {
 func (a *app) cmdComposeRestore(args []string) {
 	fs := flag.NewFlagSet("compose-restore", flag.ContinueOnError)
 	var files multiFlag
-	project := fs.String("p", "", "project name")
+	project := ""
+	fs.StringVar(&project, "p", "", "project name")
+	fs.StringVar(&project, "project-name", "", "project name")
 	stdin := fs.Bool("stdin", false, "read the bundle stream from stdin")
 	spool := fs.Bool("spool", false, "with --stdin, spool the bundle before restoring")
 	force := fs.Bool("force", false, "restore even if running containers mount the volumes")
@@ -772,7 +957,7 @@ func (a *app) cmdComposeRestore(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	cf, err := dvol.LoadComposeFile(path, *project)
+	cf, err := dvol.LoadComposeFile(path, project)
 	if err != nil {
 		fail(err)
 	}
@@ -788,7 +973,10 @@ func (a *app) cmdComposeRestore(args []string) {
 	if *stdin {
 		input, cleanup := stdinInput(*spool, ".dvol-compose-stdin-*.archive")
 		defer cleanup()
-		if err := a.store.RestoreBundleReader(input, opts, a.volumeResolver(*force)); err != nil {
+		if err := a.restoreBundle(*force, func(resolve dvol.VolumeTargetResolver, beforeCommit func([]string) error) error {
+			opts.BeforeCommit = beforeCommit
+			return a.store.RestoreBundleReader(input, opts, resolve)
+		}); err != nil {
 			fail(err)
 		}
 		fmt.Fprintf(os.Stderr, "restored compose project %s from stdin\n", cf.Project)
@@ -803,7 +991,10 @@ func (a *app) cmdComposeRestore(args []string) {
 			fail(err)
 		}
 	}
-	if err := a.store.RestoreBundleTargets(archive, opts, a.volumeResolver(*force)); err != nil {
+	if err := a.restoreBundle(*force, func(resolve dvol.VolumeTargetResolver, beforeCommit func([]string) error) error {
+		opts.BeforeCommit = beforeCommit
+		return a.store.RestoreBundleTargets(archive, opts, resolve)
+	}); err != nil {
 		fail(err)
 	}
 	fmt.Printf("restored compose project %s (%s) from %s\n", cf.Project, strings.Join(names, ", "), archive)
@@ -818,8 +1009,8 @@ Usage:
   docker dvol backup [options] <volume>...  back up one or more volumes
   docker dvol restore [options] <volume>... [backup]
   docker dvol verify <volume> [backup] | verify --archive <path>
-  docker dvol compose-backup [-f file.yml] [-p project] [options]
-  docker dvol compose-restore [-f file.yml] [-p project] [--stdin] [--spool] [archive]
+  docker dvol compose-backup [-f file.yml] [-p|--project-name project] [options]
+  docker dvol compose-restore [-f file.yml] [-p|--project-name project] [--stdin] [--spool] [archive]
 
 Global flags:
   --root <dir>          archive repository (default ~/.local/share/docker-volume-backup)
@@ -827,6 +1018,8 @@ Global flags:
   --log-level <level>   TRACE, DEBUG, INFO (default), WARN or ERROR
   --archive-mode <oct>  permission of published archives (default 0644)
   --allow-atime         allow reading sources that cannot be opened with O_NOATIME
+  --best-effort-metadata
+                        warn instead of failing when restore cannot recreate metadata
 
 backup flags:
   --compression <gzip|xz|zstd|lz4>  --level <n>  --threads <n>

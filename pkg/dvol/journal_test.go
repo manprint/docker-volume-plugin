@@ -25,6 +25,88 @@ func crash(t *testing.T, rec *replacement) {
 	rec.closed = true
 }
 
+func TestReplacementGroupCrashRecoveryIsAllOrNothing(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		name := "before-commit"
+		if committed {
+			name = "after-commit"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newTestStore(t)
+			group, err := s.beginReplacementGroup()
+			if err != nil {
+				t.Fatal(err)
+			}
+			groupName := filepath.Base(group.path)
+			names := []string{"app", "db"}
+			targets := map[string]string{}
+			records := make([]*replacement, 0, len(names))
+			for _, volume := range names {
+				target := dockerLikeTarget(t, volume)
+				writeVolumeFile(t, target, "data.txt", "old-"+volume)
+				staging, err := os.MkdirTemp(filepath.Dir(target), ".group-stage-*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeVolumeFile(t, staging, "data.txt", "new-"+volume)
+				rec, err := s.beginStaging(staging)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := rec.setGroup(groupName); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := s.prepareStage(stageReplacement{rec: rec, staging: staging, target: target}); err != nil {
+					t.Fatal(err)
+				}
+				targets[volume] = target
+				records = append(records, rec)
+			}
+			if committed {
+				if err := group.setPublished(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, rec := range records {
+				crash(t, rec)
+			}
+			crashGroup(t, group)
+
+			if _, err := NewStore(Config{Root: s.cfg.Root}); err != nil {
+				t.Fatalf("recover replacement group: %v", err)
+			}
+			for _, volume := range names {
+				got, err := os.ReadFile(filepath.Join(targets[volume], "data.txt"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "old-" + volume
+				if committed {
+					want = "new-" + volume
+				}
+				if string(got) != want {
+					t.Fatalf("%s recovered %q, want %q", volume, got, want)
+				}
+			}
+			entries, err := os.ReadDir(s.journalDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("replacement group recovery left journal files: %v", entries)
+			}
+		})
+	}
+}
+
+func crashGroup(t *testing.T, group *replacementGroup) {
+	t.Helper()
+	if err := group.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	group.closed = true
+}
+
 // dockerLikeTarget builds a target that mimics a Docker volume mountpoint:
 // <somewhere>/<volume>/_data, entirely outside the dvol repository.
 func dockerLikeTarget(t *testing.T, name string) string {
@@ -304,7 +386,7 @@ func TestRestoreCrashRecoveryEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := extractTarStream(tr, nil, s.logger(), func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
+	if err := extractTarStream(tr, nil, s.logger(), s.cfg.BestEffortMetadata, func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
 		return hdr.Name, staging, payload, true, nil
 	}); err != nil {
 		t.Fatal(err)

@@ -75,7 +75,7 @@ func FuzzExtractTarStream(f *testing.F) {
 			return // not a gzip stream: nothing to extract
 		}
 		tr := tar.NewReader(gz)
-		_ = extractTarStream(tr, nil, nil, func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
+		_ = extractTarStream(tr, nil, nil, true, func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
 			return hdr.Name, staging, payload, true, nil
 		})
 		_ = gz.Close()

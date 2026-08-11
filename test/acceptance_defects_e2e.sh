@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # single quotes intentionally defer expansion to the container shell
 set -Eeuo pipefail
 
 # Acceptance suite for the defects fixed after the 2026-08-08 review (REVIEW.md).
@@ -129,6 +130,25 @@ scenario_bundle_into_single_volume() {
 		|| fail "the refused bundle restore modified the volume"
 	pass "victim volume untouched"
 
+	# A tar path equivalent to manifest.json must not evade classification just
+	# because it has more than one leading ./ component.
+	local noncanonical="$WORK_DIR/noncanonical-bundle.tar.gz"
+	docker run --rm -v "$WORK_DIR:/work" python:3.12-alpine python -c '
+import io, json, sys, tarfile
+payload = json.dumps({"format":"dvol-bundle-v1", "volumes":sys.argv[1:]}).encode()
+with tarfile.open("/work/noncanonical-bundle.tar.gz", "w:gz", format=tarfile.PAX_FORMAT) as archive:
+    header = tarfile.TarInfo("././manifest.json")
+    header.size = len(payload)
+    header.mode = 0o644
+    archive.addfile(header, io.BytesIO(payload))
+' "$a" "$b"
+	expect_failure "restoring a non-canonical bundle as a single volume" \
+		dvol_cmd --root "$ARCHIVE_ROOT" restore "$victim" "$noncanonical"
+	expect_output "multi-volume dvol bundle"
+	[[ "$before" == "$(manifest_digest "$(mountpoint_of "$victim")")" ]] \
+		|| fail "the non-canonical bundle modified the victim volume"
+	pass "non-canonical manifest classified before publication"
+
 	# and the inverse direction
 	local single
 	single="$(dvol_cmd --root "$ARCHIVE_ROOT" backup "$victim" | sed -n 's/^backed up .* -> //p')"
@@ -208,6 +228,16 @@ scenario_restore_missing_volume() {
 	in_volume "$web" 'test "$(cat /data/data.txt)" = web-data' || fail "web not restored"
 	in_volume "$db" 'test "$(cat /data/data.txt)" = db-data' || fail "deleted volume not recreated and restored"
 	pass "both volumes restored, missing one recreated"
+
+	local failed="dvol_${TAG}_h1failed" corrupt="$WORK_DIR/corrupt.tar.gz"
+	CREATED_VOLUMES+=("$failed")
+	printf 'incomplete archive' >"$corrupt"
+	expect_failure "failed restore rolls back a newly created Docker volume" \
+		dvol_cmd --root "$ARCHIVE_ROOT" restore "$failed" "$corrupt"
+	if docker volume inspect "$failed" >/dev/null 2>&1; then
+		fail "failed restore left the newly created Docker volume behind"
+	fi
+	pass "failed restore removed its empty Docker volume"
 }
 
 # ---------------------------------------------------------------------------
@@ -396,9 +426,11 @@ scenario_fidelity() {
 		touch -d "2021-06-01 12:30:00" /data/config/db.ini /data/config
 	'
 	docker run --rm --user 0 -v "$volume:/data" alpine:3.20 sh -ec '
-		apk add --no-cache attr >/dev/null 2>&1 || exit 0
+		apk add --no-cache attr >/dev/null
 		setfattr -n user.dvol_test -v acceptance /data/index.html
-	' || true
+	'
+	[[ "$(getfattr -n user.dvol_test --only-values -- "$(mountpoint_of "$volume")/index.html")" == "acceptance" ]] \
+		|| fail "the fidelity fixture could not create its required xattr"
 
 	before="$(tree_manifest "$(mountpoint_of "$volume")")"
 	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression zstd "$volume" | sed -n 's/^backed up .* -> //p')"
@@ -449,7 +481,7 @@ scenario_verify() {
 
 main() {
 	command -v docker >/dev/null 2>&1 || fail "Docker is required"
-	command -v getfattr >/dev/null 2>&1 || echo "note: getfattr missing, xattr columns will be empty" >&2
+	command -v getfattr >/dev/null 2>&1 || fail "required command not found: getfattr (install the attr package)"
 	case "$DVOL_MODE" in
 		direct) [[ -x "$DVOL_BIN" ]] || fail "build the CLI plugin first: $DVOL_BIN" ;;
 		docker) docker dvol --help >/dev/null 2>&1 || fail "docker dvol plugin unavailable" ;;

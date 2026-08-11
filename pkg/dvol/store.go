@@ -53,7 +53,10 @@ func (s *Store) backupsDir() string {
 	return filepath.Join(s.cfg.Root, backupsDir)
 }
 
-// VolumePath returns the data directory of a volume.
+// VolumePath returns the data directory of a repository-managed volume.
+//
+// Legacy API: the dvol CLI operates on real Docker volume mountpoints and does
+// not use repository-managed volumes. It is retained for library compatibility.
 func (s *Store) VolumePath(name string) string { return filepath.Join(s.volumesDir(), name) }
 
 func (s *Store) metaPath(name string) string { return filepath.Join(s.metaDir(), name+".json") }
@@ -112,6 +115,9 @@ func containsAny(s, chars string) bool {
 
 // Create makes a new volume. An empty directory is created on disk and the
 // metadata is persisted.
+//
+// Legacy API: the dvol CLI creates volumes through Docker. This method is only
+// for embedders that intentionally use the legacy repository-managed model.
 func (s *Store) Create(name string, opts map[string]string) error {
 	if err := checkName(name); err != nil {
 		return err
@@ -167,6 +173,9 @@ func (s *Store) writeMeta(name string, opts map[string]string) error {
 
 // Get returns the volume and its metadata, or ErrNotFound. The Size field is
 // not populated (computing it walks the whole volume); use Size or List.
+//
+// Legacy API: this describes repository-managed volumes, not Docker
+// volumes discovered by the CLI.
 func (s *Store) Get(name string) (*Volume, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
@@ -189,15 +198,36 @@ func (s *Store) Get(name string) (*Volume, error) {
 	}, nil
 }
 
-// Size returns the total size in bytes of the volume data.
+// Size returns the best-effort total size in bytes of legacy volume data.
+// Use SizeWithError when traversal failures must be reported.
+//
+// Legacy API: use Docker volume discovery and BackupSource for CLI-equivalent
+// behavior.
 func (s *Store) Size(name string) int64 {
 	if checkName(name) != nil {
 		return 0
 	}
-	return dirSize(s.VolumePath(name))
+	total, _ := dirSize(s.VolumePath(name))
+	return total
 }
 
-// List returns all volumes sorted by name, with Size populated.
+// SizeWithError returns the total size without hiding traversal failures.
+func (s *Store) SizeWithError(name string) (int64, error) {
+	if err := checkName(name); err != nil {
+		return 0, err
+	}
+	total, err := dirSize(s.VolumePath(name))
+	if os.IsNotExist(err) {
+		return 0, ErrNotFound
+	}
+	return total, err
+}
+
+// List returns all legacy repository-managed volumes sorted by name, with Size
+// populated. Traversal failures are returned instead of producing partial
+// sizes.
+//
+// Legacy API: the dvol CLI lists volumes through Docker.
 func (s *Store) List() ([]*Volume, error) {
 	entries, err := os.ReadDir(s.metaDir())
 	if err != nil {
@@ -216,14 +246,20 @@ func (s *Store) List() ([]*Volume, error) {
 		if err != nil {
 			return nil, err
 		}
-		v.Size = s.Size(name)
+		v.Size, err = s.SizeWithError(name)
+		if err != nil {
+			return nil, fmt.Errorf("size volume %q: %w", name, err)
+		}
 		vols = append(vols, v)
 	}
 	sort.Slice(vols, func(i, j int) bool { return vols[i].Name < vols[j].Name })
 	return vols, nil
 }
 
-// Remove deletes the volume directory and its metadata.
+// Remove deletes a legacy repository-managed volume and its metadata.
+//
+// Legacy API: the dvol CLI deletes volumes through Docker and does not expose
+// this operation.
 func (s *Store) Remove(name string) error {
 	if err := checkName(name); err != nil {
 		return err
@@ -248,16 +284,16 @@ func nameFromMetaFile(f string) string {
 	return f[:len(f)-len(".json")]
 }
 
-func dirSize(dir string) int64 {
+func dirSize(dir string) (int64, error) {
 	var total int64
-	_ = filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+	err := filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if !info.IsDir() {
 			total += info.Size()
 		}
 		return nil
 	})
-	return total
+	return total, err
 }

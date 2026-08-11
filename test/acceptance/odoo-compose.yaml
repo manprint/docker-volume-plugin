@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16
+    image: ${POSTGRES_IMAGE:-postgres:16.14-bookworm}
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: odoo
@@ -14,7 +14,7 @@ services:
       - db-data:/var/lib/postgresql/data
 
   odoo:
-    image: odoo:17.0
+    image: ${ODOO_IMAGE:-odoo:17.0-20260723}
     depends_on:
       db:
         condition: service_healthy

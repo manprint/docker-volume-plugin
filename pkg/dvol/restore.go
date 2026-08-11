@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// RestoreOptions selects what a bundle restore touches.
+// RestoreOptions configures single-volume and bundle restores.
 type RestoreOptions struct {
 	// Volumes limits the restore to these volumes. Empty means every volume in
 	// the bundle.
@@ -27,6 +27,11 @@ type RestoreOptions struct {
 	// from the compose file rather than from the operator, and a volume that did
 	// not exist when the bundle was written is legitimately absent.
 	AllowMissing bool
+	// BeforeCommit is invoked after the complete archive and staging trees have
+	// been validated, immediately before any live target is replaced. It lets
+	// the Docker-facing layer recheck operational preconditions that may have
+	// changed during a long extraction.
+	BeforeCommit func(volumes []string) error
 }
 
 // manifestProbeLimit bounds how much of a leading manifest.json is buffered
@@ -54,6 +59,11 @@ func (s *Store) Restore(name, backupPath string) error {
 // contents of a backup archive. Unlike Restore, it does not create dvol
 // metadata; the Docker Engine already owns the volume metadata.
 func (s *Store) RestoreSource(name, target, backupPath string) (err error) {
+	return s.RestoreSourceWithOptions(name, target, backupPath, RestoreOptions{})
+}
+
+// RestoreSourceWithOptions is RestoreSource with an optional pre-commit guard.
+func (s *Store) RestoreSourceWithOptions(name, target, backupPath string, opts RestoreOptions) (err error) {
 	progress := s.operationProgress("restore")
 	s.logger().Info("restore started", LogField{Key: "volume", Value: name}, LogField{Key: "archive", Value: backupPath}, LogField{Key: "target", Value: target})
 	defer func() {
@@ -78,13 +88,18 @@ func (s *Store) RestoreSource(name, target, backupPath string) (err error) {
 		return err
 	}
 	defer closeArchive()
-	return s.restoreSingleVolume(name, target, tr, progress, func() error { return closeArchive() })
+	return s.restoreSingleVolume(name, target, tr, progress, opts, func() error { return closeArchive() })
 }
 
 // RestoreSourceReader is the stream equivalent of RestoreSource. The input is
 // decompressed and extracted directly into staging; no archive spool file is
 // created. The live target is changed only after a complete valid stream.
 func (s *Store) RestoreSourceReader(name, target string, input io.Reader) (err error) {
+	return s.RestoreSourceReaderWithOptions(name, target, input, RestoreOptions{})
+}
+
+// RestoreSourceReaderWithOptions is the stream restore with a pre-commit guard.
+func (s *Store) RestoreSourceReaderWithOptions(name, target string, input io.Reader, opts RestoreOptions) (err error) {
 	progress := s.operationProgress("restore stream")
 	s.logger().Info("restore stream started", LogField{Key: "volume", Value: name}, LogField{Key: "target", Value: target})
 	defer func() {
@@ -116,14 +131,14 @@ func (s *Store) RestoreSourceReader(name, target string, input io.Reader) (err e
 		}
 	}()
 	s.logger().Debug("restore stream decoder opened", LogField{Key: "volume", Value: name})
-	return s.restoreSingleVolume(name, target, tr, progress, func() error {
+	return s.restoreSingleVolume(name, target, tr, progress, opts, func() error {
 		finished = true
 		return finishArchiveReader(r)
 	})
 }
 
 // restoreSingleVolume stages a single-volume archive and swaps it into target.
-func (s *Store) restoreSingleVolume(name, target string, tr *tar.Reader, progress *Progress, finish func() error) error {
+func (s *Store) restoreSingleVolume(name, target string, tr *tar.Reader, progress *Progress, opts RestoreOptions, finish func() error) error {
 	staging, rec, err := s.newStaging(filepath.Dir(target), ".restore-*")
 	if err != nil {
 		return err
@@ -134,7 +149,7 @@ func (s *Store) restoreSingleVolume(name, target string, tr *tar.Reader, progres
 
 	entries := 0
 	firstEntry := true
-	err = extractTarStream(tr, progress, s.logger(), func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
+	err = extractTarStream(tr, progress, s.logger(), s.cfg.BestEffortMetadata, func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
 		if firstEntry {
 			firstEntry = false
 			// A bundle restored through the single-volume path used to succeed
@@ -162,6 +177,11 @@ func (s *Store) restoreSingleVolume(name, target string, tr *tar.Reader, progres
 	}
 	if entries == 0 {
 		return fmt.Errorf("backup archive contains no entries")
+	}
+	if opts.BeforeCommit != nil {
+		if err := opts.BeforeCommit([]string{name}); err != nil {
+			return fmt.Errorf("restore pre-commit check: %w", err)
+		}
 	}
 	return s.replaceStage(rec, staging, target)
 }
@@ -297,7 +317,7 @@ func (s *Store) restoreBundleStream(tr *tar.Reader, opts RestoreOptions, resolve
 	manifestSeen := false
 	firstEntry := true
 	inManifest := map[string]bool{}
-	err = extractTarStream(tr, progress, s.logger(), func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
+	err = extractTarStream(tr, progress, s.logger(), s.cfg.BestEffortMetadata, func(hdr *tar.Header, payload io.Reader) (string, string, io.Reader, bool, error) {
 		if firstEntry {
 			firstEntry = false
 			isBundle, buffered, probeErr := probeBundleManifest(hdr, payload)
@@ -423,13 +443,17 @@ func (s *Store) restoreBundleStream(tr *tar.Reader, opts RestoreOptions, resolve
 		}
 	}
 	s.logger().Debug("restore bundle staged", LogField{Key: "volumes", Value: len(order)})
-	for _, name := range order {
-		v := staged[name]
-		if err := s.replaceStage(v.rec, v.root, v.target); err != nil {
-			return err
+	if opts.BeforeCommit != nil {
+		if err := opts.BeforeCommit(append([]string(nil), order...)); err != nil {
+			return fmt.Errorf("restore pre-commit check: %w", err)
 		}
 	}
-	return nil
+	replacements := make([]stageReplacement, 0, len(order))
+	for _, name := range order {
+		v := staged[name]
+		replacements = append(replacements, stageReplacement{rec: v.rec, staging: v.root, target: v.target})
+	}
+	return s.replaceStagesAtomically(replacements)
 }
 
 // selectBundleVolumes intersects the manifest with the requested volumes.
@@ -537,7 +561,10 @@ func (s *Store) openArchiveForRestore(path string, progress *Progress) (*tar.Rea
 // bundle. The payload is buffered so a volume that legitimately contains its
 // own manifest.json can still be extracted from the buffer.
 func probeBundleManifest(hdr *tar.Header, payload io.Reader) (isBundle bool, buffered *bytes.Reader, err error) {
-	name := strings.TrimPrefix(hdr.Name, "./")
+	// Classify the same path spelling that extraction will use. filepath.Clean
+	// in safeJoin accepts repeated relative prefixes, so checking only one
+	// leading "./" here would let a bundle reach the single-volume path.
+	name := path.Clean(hdr.Name)
 	if name != bundleManifestName || hdr.Typeflag != tar.TypeReg {
 		return false, nil, nil
 	}
@@ -610,7 +637,7 @@ type routeFunc func(hdr *tar.Header, payload io.Reader) (rel, base string, body 
 // would be bumped by every entry created inside it. Deferring only directories
 // keeps peak memory proportional to the number of directories rather than to
 // the number of files.
-func extractTarStream(tr *tar.Reader, progress *Progress, logger *Logger, route routeFunc) error {
+func extractTarStream(tr *tar.Reader, progress *Progress, logger *Logger, bestEffortMetadata bool, route routeFunc) error {
 	var dirs []fileMeta
 	for {
 		hdr, err := tr.Next()
@@ -637,7 +664,7 @@ func extractTarStream(tr *tar.Reader, progress *Progress, logger *Logger, route 
 		if err != nil {
 			return err
 		}
-		materialised, err := extractEntry(hdr, body, target, base, progress, logger)
+		materialised, err := extractEntry(hdr, body, target, base, progress, logger, bestEffortMetadata)
 		if err != nil {
 			return err
 		}
@@ -658,12 +685,12 @@ func extractTarStream(tr *tar.Reader, progress *Progress, logger *Logger, route 
 			dirs = append(dirs, meta)
 			continue
 		}
-		if err := meta.apply(logger); err != nil {
+		if err := meta.apply(logger, bestEffortMetadata); err != nil {
 			return err
 		}
 	}
 	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := dirs[i].apply(logger); err != nil {
+		if err := dirs[i].apply(logger, bestEffortMetadata); err != nil {
 			return err
 		}
 	}
@@ -682,7 +709,7 @@ type fileMeta struct {
 	xattrs map[string]string
 }
 
-func (m fileMeta) apply(logger *Logger) error {
+func (m fileMeta) apply(logger *Logger, bestEffortMetadata bool) error {
 	if m.isLink {
 		if err := os.Lchown(m.path, m.uid, m.gid); err != nil {
 			return err
@@ -704,7 +731,9 @@ func (m fileMeta) apply(logger *Logger) error {
 	// clears security.capability and chmod rewrites the POSIX ACL mask, so both
 	// have to happen first.
 	if len(m.xattrs) > 0 {
-		applyXattrs(m.path, m.xattrs, logger)
+		if err := applyXattrs(m.path, m.xattrs, logger, bestEffortMetadata); err != nil {
+			return err
+		}
 	}
 	return applyTimes(m.path, m.isLink, m.atime, m.mtime)
 }
@@ -772,7 +801,7 @@ func (s *Store) ensureVolume(name string) error {
 // volume dir, used to resolve hard links. It reports whether the entry produced
 // a filesystem object: metadata must never be applied to a path that was
 // skipped, which used to abort every restore of an archive containing a FIFO.
-func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress *Progress, logger *Logger) (bool, error) {
+func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress *Progress, logger *Logger, bestEffortMetadata bool) (bool, error) {
 	switch hdr.Typeflag {
 	case tar.TypeDir:
 		if err := checkNoSymlinkAncestors(base, target); err != nil {
@@ -855,7 +884,12 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 			return false, err
 		}
 		if err := unix.Mkfifo(target, uint32(hdr.Mode&0o777)); err != nil {
-			logger.Warn("FIFO not restored", LogField{Key: "path", Value: target}, LogField{Key: "error", Value: err})
+			if logger != nil {
+				logger.Warn("FIFO not restored", LogField{Key: "path", Value: target}, LogField{Key: "error", Value: err})
+			}
+			if !bestEffortMetadata {
+				return false, fmt.Errorf("restore FIFO %q: %w", hdr.Name, err)
+			}
 			return false, nil
 		}
 	case tar.TypeChar, tar.TypeBlock:
@@ -885,12 +919,22 @@ func extractEntry(hdr *tar.Header, body io.Reader, target, base string, progress
 		if err := unix.Mknod(target, mode, int(dev)); err != nil {
 			// Creating device nodes needs CAP_MKNOD. A restore running without
 			// it must not fail outright: the rest of the volume is still valid.
-			logger.Warn("device node not restored", LogField{Key: "path", Value: target}, LogField{Key: "error", Value: err})
+			if logger != nil {
+				logger.Warn("device node not restored", LogField{Key: "path", Value: target}, LogField{Key: "error", Value: err})
+			}
+			if !bestEffortMetadata {
+				return false, fmt.Errorf("restore device node %q: %w", hdr.Name, err)
+			}
 			return false, nil
 		}
 	default:
-		logger.Warn("skipping unsupported archive entry",
-			LogField{Key: "path", Value: hdr.Name}, LogField{Key: "type", Value: string(rune(hdr.Typeflag))})
+		if logger != nil {
+			logger.Warn("skipping unsupported archive entry",
+				LogField{Key: "path", Value: hdr.Name}, LogField{Key: "type", Value: string(rune(hdr.Typeflag))})
+		}
+		if !bestEffortMetadata {
+			return false, fmt.Errorf("unsupported archive entry %q (type %d)", hdr.Name, hdr.Typeflag)
+		}
 		return false, nil
 	}
 	return true, nil

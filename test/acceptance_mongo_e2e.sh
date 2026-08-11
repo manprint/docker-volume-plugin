@@ -13,7 +13,10 @@ MONGO_COMPOSE="$SCRIPT_DIR/acceptance/mongo-compose.yaml"
 MONGO_START="$SCRIPT_DIR/acceptance/script-start.mongo.sh"
 DVOL_BIN="${DVOL_BIN:-$PROJECT_ROOT/bin/dvol-cli-plugin}"
 DVOL_MODE="${DVOL_MODE:-direct}"
-readonly SCRIPT_DIR PROJECT_ROOT WORK_DIR ARCHIVE_ROOT MONGO_COMPOSE MONGO_START DVOL_BIN DVOL_MODE
+MONGO_IMAGE="${MONGO_IMAGE:-mongo:7.0.39-jammy}"
+BUSYBOX_IMAGE="${BUSYBOX_IMAGE:-busybox:1.36.1}"
+readonly SCRIPT_DIR PROJECT_ROOT WORK_DIR ARCHIVE_ROOT MONGO_COMPOSE MONGO_START DVOL_BIN DVOL_MODE MONGO_IMAGE BUSYBOX_IMAGE
+export MONGO_IMAGE
 
 dvol_cmd() {
 	case "$DVOL_MODE" in
@@ -320,16 +323,16 @@ backup_flat_mongo_volumes() {
 write_existing_target_sentinels() {
 	docker volume create mongo_data >/dev/null
 	docker volume create mongo_logs >/dev/null
-	docker run --rm --user 0 --entrypoint sh -v mongo_data:/data busybox:1.36 -eu -c \
+	docker run --rm --user 0 --entrypoint sh -v mongo_data:/data "$BUSYBOX_IMAGE" -eu -c \
 		'printf sentinel > /data/acceptance-sentinel'
-	docker run --rm --user 0 --entrypoint sh -v mongo_logs:/data busybox:1.36 -eu -c \
+	docker run --rm --user 0 --entrypoint sh -v mongo_logs:/data "$BUSYBOX_IMAGE" -eu -c \
 		'printf sentinel > /data/acceptance-sentinel'
 }
 
 assert_sentinels_removed() {
-	docker run --rm --user 0 --entrypoint sh -v mongo_data:/data busybox:1.36 -eu -c \
+	docker run --rm --user 0 --entrypoint sh -v mongo_data:/data "$BUSYBOX_IMAGE" -eu -c \
 		'test ! -e /data/acceptance-sentinel'
-	docker run --rm --user 0 --entrypoint sh -v mongo_logs:/data busybox:1.36 -eu -c \
+	docker run --rm --user 0 --entrypoint sh -v mongo_logs:/data "$BUSYBOX_IMAGE" -eu -c \
 		'test ! -e /data/acceptance-sentinel'
 }
 
@@ -361,13 +364,13 @@ probe_restored_copy() {
 	local data_copy="$1" logs_copy="$2" probe="mongo-accept-probe-${BASHPID}"
 	PROBE_CONTAINERS+=("$probe")
 	docker run -d --name "$probe" \
-		-v "$data_copy:/probe-data" mongo:7 \
+		-v "$data_copy:/probe-data" "$MONGO_IMAGE" \
 		mongod --dbpath /probe-data --bind_ip_all --logpath /dev/null >/dev/null
 	wait_for "restored MongoDB copy" docker exec "$probe" mongosh --quiet \
 		--eval 'db.getSiblingDB("acceptance").records.countDocuments() === 3 ? 0 : quit(1)'
 	docker exec "$probe" mongosh --quiet --eval \
 		'const a=db.getSiblingDB("acceptance").records.find({}, {_id:0}).sort({id:1}).toArray(); if (a[0].payload !== "mongo-alpha" || a[2].payload !== "mongo-gamma") quit(1);'
-	docker run --rm --user 0 --entrypoint sh -v "$logs_copy:/data:ro" busybox:1.36 -eu -c \
+	docker run --rm --user 0 --entrypoint sh -v "$logs_copy:/data:ro" "$BUSYBOX_IMAGE" -eu -c \
 		'grep -Fq mongo-acceptance-log-marker /data/acceptance-marker.log'
 	docker rm -f "$probe" >/dev/null
 }
@@ -471,8 +474,8 @@ PY
 main() {
 	preflight
 	mkdir -p "$ARCHIVE_ROOT"
-	require_image mongo:7
-	require_image busybox:1.36
+	require_image "$MONGO_IMAGE"
+	require_image "$BUSYBOX_IMAGE"
 	for compression in gzip xz zstd lz4; do
 		run_case compose "$compression"
 		run_case script "$compression"
