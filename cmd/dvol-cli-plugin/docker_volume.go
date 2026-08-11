@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,9 +9,19 @@ import (
 	"strings"
 )
 
-var errDockerVolumeNotFound = errors.New("docker volume not found")
+var (
+	errDockerVolumeNotFound    = errors.New("docker volume not found")
+	errDockerContainerNotFound = errors.New("docker container not found")
+)
 
-const restoreOwnerLabel = "com.github.fabio.dvol.restore-owner"
+const (
+	restoreOwnerLabel      = "com.github.fabio.dvol.restore-owner"
+	volumeLockLabel        = "com.github.fabio.dvol.locked-volume"
+	volumeLockManagedLabel = "com.github.fabio.dvol.volume-lock"
+	volumeLockVersion      = "1"
+	volumeLockMount        = "/dvol-lock"
+	defaultVolumeLockImage = "busybox:1.36.1"
+)
 
 type dockerVolumeInfo struct {
 	Name       string
@@ -25,9 +36,32 @@ type dockerVolumeClient interface {
 	Inspect(name string) (dockerVolumeInfo, error)
 	Create(name, restoreOwner string) (dockerVolumeInfo, error)
 	Remove(name string) error
+	// LockVolume creates or restarts a Docker-managed guard reference. The
+	// returned boolean reports whether a new guard container was created.
+	LockVolume(name, image string) (bool, error)
+	// UnlockVolume removes dvol's guard reference. The returned boolean reports
+	// whether a guard existed.
+	UnlockVolume(name string) (bool, error)
 	// ContainersUsing returns the names of the running containers that have the
-	// volume mounted.
+	// volume mounted, excluding dvol's own lock guard.
 	ContainersUsing(name string) ([]string, error)
+}
+
+type dockerContainerInfo struct {
+	ID     string
+	Name   string
+	Config struct {
+		Labels map[string]string
+	}
+	State struct {
+		Running bool
+	}
+	Mounts []struct {
+		Type        string
+		Name        string
+		Destination string
+		RW          bool
+	}
 }
 
 // dockerCLI uses the Docker CLI instead of linking the full Engine client.
@@ -107,20 +141,141 @@ func (c *dockerCLI) Remove(name string) error {
 	return nil
 }
 
+func volumeLockContainerName(volume string) string {
+	sum := sha256.Sum256([]byte(volume))
+	return fmt.Sprintf("dvol-lock-%x", sum[:12])
+}
+
+func (c *dockerCLI) inspectContainer(name string) (dockerContainerInfo, error) {
+	out, err := c.run("container", "inspect", "--format", "{{json .}}", name)
+	if err != nil {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "no such container") || strings.Contains(msg, "not found") {
+			return dockerContainerInfo{}, errDockerContainerNotFound
+		}
+		return dockerContainerInfo{}, err
+	}
+	var info dockerContainerInfo
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &info); err != nil {
+		return dockerContainerInfo{}, fmt.Errorf("decode Docker container %q: %w", name, err)
+	}
+	return info, nil
+}
+
+func isVolumeLockContainer(info dockerContainerInfo, volume string) bool {
+	if info.Config.Labels[volumeLockManagedLabel] != volumeLockVersion ||
+		info.Config.Labels[volumeLockLabel] != volume {
+		return false
+	}
+	for _, mount := range info.Mounts {
+		if mount.Type == "volume" && mount.Name == volume &&
+			mount.Destination == volumeLockMount && !mount.RW {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *dockerCLI) LockVolume(name, image string) (bool, error) {
+	guard := volumeLockContainerName(name)
+	info, err := c.inspectContainer(guard)
+	if err == nil {
+		if !isVolumeLockContainer(info, name) {
+			return false, fmt.Errorf("docker container %q collides with the dvol lock name but is not the lock for volume %q", guard, name)
+		}
+		if !info.State.Running {
+			if _, err := c.run("container", "start", guard); err != nil {
+				return false, fmt.Errorf("restart lock guard %q: %w; its stopped reference still protects volume %q from direct removal", guard, err, name)
+			}
+		}
+		return false, nil
+	}
+	if !errors.Is(err, errDockerContainerNotFound) {
+		return false, err
+	}
+	if image == "" {
+		image = defaultVolumeLockImage
+	}
+	_, createErr := c.run("container", "create",
+		"--name", guard,
+		"--label", volumeLockManagedLabel+"="+volumeLockVersion,
+		"--label", volumeLockLabel+"="+name,
+		"--network", "none",
+		"--read-only",
+		"--cap-drop", "ALL",
+		"--security-opt", "no-new-privileges=true",
+		"--restart", "unless-stopped",
+		"--mount", "type=volume,source="+name+",target="+volumeLockMount+",readonly",
+		image, "tail", "-f", "/dev/null")
+	if createErr != nil {
+		// Docker container names are unique. If another lock operation won the
+		// race, accept its correctly labelled guard instead of failing.
+		info, inspectErr := c.inspectContainer(guard)
+		if inspectErr != nil || !isVolumeLockContainer(info, name) {
+			return false, fmt.Errorf("create lock guard %q: %w", guard, createErr)
+		}
+		if info.State.Running {
+			return false, nil
+		}
+		if _, err := c.run("container", "start", guard); err != nil {
+			return false, fmt.Errorf("restart concurrently created lock guard %q: %w", guard, err)
+		}
+		return false, nil
+	}
+	if _, err := c.run("container", "start", guard); err != nil {
+		return true, fmt.Errorf("start lock guard %q: %w; its stopped reference still protects volume %q from direct removal", guard, err, name)
+	}
+	return true, nil
+}
+
+func (c *dockerCLI) UnlockVolume(name string) (bool, error) {
+	guard := volumeLockContainerName(name)
+	info, err := c.inspectContainer(guard)
+	if errors.Is(err, errDockerContainerNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !isVolumeLockContainer(info, name) {
+		return false, fmt.Errorf("docker container %q collides with the dvol lock name but is not the lock for volume %q", guard, name)
+	}
+	if _, err := c.run("container", "rm", "--force", guard); err != nil {
+		return false, fmt.Errorf("remove lock guard %q: %w", guard, err)
+	}
+	return true, nil
+}
+
 // ContainersUsing lists the running containers that mount the volume. Restoring
 // into a mounted volume replaces the directory a container already holds open:
 // the container keeps writing into the detached inode and never sees the
 // restored data, so the CLI refuses unless the operator forces it.
 func (c *dockerCLI) ContainersUsing(name string) ([]string, error) {
-	out, err := c.run("ps", "--filter", "volume="+name, "--format", "{{.Names}}")
+	out, err := c.run("ps", "--filter", "volume="+name, "--format", "{{.ID}}")
 	if err != nil {
 		return nil, err
 	}
 	var names []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			names = append(names, line)
+		id := strings.TrimSpace(line)
+		if id == "" {
+			continue
 		}
+		info, err := c.inspectContainer(id)
+		if errors.Is(err, errDockerContainerNotFound) {
+			continue // removed between ps and inspect
+		}
+		if err != nil {
+			return nil, err
+		}
+		if isVolumeLockContainer(info, name) {
+			continue
+		}
+		containerName := strings.TrimPrefix(info.Name, "/")
+		if containerName == "" {
+			containerName = id
+		}
+		names = append(names, containerName)
 	}
 	return names, nil
 }

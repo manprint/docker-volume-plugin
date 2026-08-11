@@ -52,6 +52,12 @@ new_volume() {
 
 mountpoint_of() { docker volume inspect --format '{{.Mountpoint}}' "$1"; }
 
+lock_container_name() {
+	local digest
+	digest="$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
+	printf 'dvol-lock-%s\n' "${digest:0:24}"
+}
+
 # in_volume runs a shell snippet inside the volume, as root, with /data mounted.
 in_volume() {
 	local volume="$1"; shift
@@ -366,6 +372,80 @@ scenario_volume_in_use() {
 }
 
 # ---------------------------------------------------------------------------
+# Volume lock: Docker itself must refuse direct, forced and Compose removal.
+# ---------------------------------------------------------------------------
+scenario_volume_lock() {
+	echo "lock: protected volumes survive Docker removal commands"
+	local volume guard archive dir project compose_volume compose_guard compose_container
+
+	volume="$(new_volume locked)"
+	in_volume "$volume" "printf original > /data/payload.txt"
+	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup "$volume" | sed -n 's/^backed up .* -> //p')"
+	dvol_cmd lock "$volume" >"$WORK_DIR/lock.log"
+	guard="$(lock_container_name "$volume")"
+	CREATED_CONTAINERS+=("$guard")
+	[[ "$(docker inspect --format '{{.State.Running}}' "$guard")" == true ]] \
+		|| fail "volume lock guard is not running"
+	dvol_cmd lock "$volume" >"$WORK_DIR/relock.log"
+	grep -Fq "already locked" "$WORK_DIR/relock.log" \
+		|| fail "second lock did not report its idempotent state"
+	in_volume "$volume" "printf changed > /data/payload.txt"
+	dvol_cmd --root "$ARCHIVE_ROOT" restore "$volume" "$archive" >/dev/null
+	[[ "$(cat "$(mountpoint_of "$volume")/payload.txt")" == original ]] \
+		|| fail "dvol lock guard incorrectly blocked or corrupted restore"
+	pass "lock guard excluded from application-container restore checks"
+
+	expect_failure "docker volume rm of a locked volume" docker volume rm "$volume"
+	expect_output "in use"
+	expect_failure "docker volume rm -f of a locked volume" docker volume rm -f "$volume"
+	expect_output "in use"
+	docker volume inspect "$volume" >/dev/null \
+		|| fail "locked volume disappeared after direct removal attempts"
+	dvol_cmd unlock "$volume" >"$WORK_DIR/unlock.log"
+	dvol_cmd unlock "$volume" >"$WORK_DIR/reunlock.log"
+	grep -Fq "already unlocked" "$WORK_DIR/reunlock.log" \
+		|| fail "second unlock did not report its idempotent state"
+	docker volume rm "$volume" >/dev/null
+	pass "direct and forced removal refused until unlock"
+
+	project="${TAG}lock"
+	dir="$WORK_DIR/$project"
+	compose_volume="${project}_data"
+	compose_container="${project}-app-1"
+	mkdir -p "$dir"
+	cat >"$dir/compose.yaml" <<YAML
+name: $project
+services:
+  app:
+    image: busybox:1.36.1
+    command: ["tail", "-f", "/dev/null"]
+    volumes:
+      - data:/data
+volumes:
+  data:
+YAML
+	docker compose -f "$dir/compose.yaml" up -d >/dev/null
+	CREATED_VOLUMES+=("$compose_volume")
+	CREATED_CONTAINERS+=("$compose_container")
+	dvol_cmd lock "$compose_volume" >/dev/null
+	compose_guard="$(lock_container_name "$compose_volume")"
+	CREATED_CONTAINERS+=("$compose_guard")
+
+	# Compose 5.x reports the failed volume removal but still exits zero. The
+	# observable contract is that Docker refuses the removal and the volume
+	# remains; a CLI plugin cannot override Compose's exit-code policy.
+	docker compose -f "$dir/compose.yaml" down -v --remove-orphans \
+		>"$WORK_DIR/out.log" 2>&1 || true
+	expect_output "Resource is still in use"
+	docker volume inspect "$compose_volume" >/dev/null \
+		|| fail "compose removed a locked volume"
+	dvol_cmd unlock "$compose_volume" >/dev/null
+	docker volume rm "$compose_volume" >/dev/null
+	docker compose -f "$dir/compose.yaml" down --remove-orphans >/dev/null 2>&1 || true
+	pass "compose down -v refused the locked volume until unlock"
+}
+
+# ---------------------------------------------------------------------------
 # H6: an interrupted restore must leave the volume recoverable.
 # ---------------------------------------------------------------------------
 scenario_interrupted_restore() {
@@ -491,7 +571,7 @@ main() {
 	docker info >/dev/null 2>&1 || fail "Docker Engine is unavailable"
 	echo "Defect acceptance dvol mode: $DVOL_MODE"
 
-	for image in alpine:3.20 python:3.12-alpine; do
+	for image in alpine:3.20 python:3.12-alpine busybox:1.36.1; do
 		docker image inspect "$image" >/dev/null 2>&1 || {
 			echo "Pulling test image: $image"
 			docker pull "$image" >/dev/null
@@ -505,6 +585,7 @@ main() {
 	scenario_restore_missing_volume
 	scenario_compose_timestamp_lookup
 	scenario_compose_volume_set
+	scenario_volume_lock
 	scenario_volume_in_use
 	scenario_interrupted_restore
 	scenario_fidelity

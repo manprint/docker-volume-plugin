@@ -31,6 +31,7 @@ type fakeDockerVolumes struct {
 	inUseErr          error
 	removeErr         error
 	removed           []string
+	locked            map[string]string
 }
 
 func (f *fakeDockerVolumes) ContainersUsing(name string) ([]string, error) {
@@ -95,6 +96,28 @@ func (f *fakeDockerVolumes) Remove(name string) error {
 	delete(f.volumes, name)
 	f.removed = append(f.removed, name)
 	return nil
+}
+
+func (f *fakeDockerVolumes) LockVolume(name, image string) (bool, error) {
+	if _, ok := f.volumes[name]; !ok {
+		return false, errDockerVolumeNotFound
+	}
+	if f.locked == nil {
+		f.locked = map[string]string{}
+	}
+	if _, ok := f.locked[name]; ok {
+		return false, nil
+	}
+	f.locked[name] = image
+	return true, nil
+}
+
+func (f *fakeDockerVolumes) UnlockVolume(name string) (bool, error) {
+	if _, ok := f.locked[name]; !ok {
+		return false, nil
+	}
+	delete(f.locked, name)
+	return true, nil
 }
 
 func TestDockerVolumeMountpointBackupAndRestore(t *testing.T) {
@@ -199,6 +222,39 @@ func TestVolumeSourceSupportsLocalBindDriverOptions(t *testing.T) {
 	}
 	if source != device {
 		t.Fatalf("local bind-backed volume resolved to %q, want device %q", source, device)
+	}
+}
+
+func TestVolumeLockLifecycleIsIdempotent(t *testing.T) {
+	fake := &fakeDockerVolumes{
+		volumes: map[string]dockerVolumeInfo{
+			"data": {Name: "data", Driver: "local", Mountpoint: t.TempDir()},
+		},
+		createMountpoints: map[string]string{},
+	}
+	a := &app{store: newCLIStore(t), docker: fake}
+
+	created, err := a.lockVolume("data", "lock-image:test")
+	if err != nil || !created {
+		t.Fatalf("first lock: created=%v err=%v", created, err)
+	}
+	if fake.locked["data"] != "lock-image:test" {
+		t.Fatalf("lock image not passed to Docker adapter: %v", fake.locked)
+	}
+	created, err = a.lockVolume("data", "different:test")
+	if err != nil || created {
+		t.Fatalf("second lock must be idempotent: created=%v err=%v", created, err)
+	}
+	removed, err := a.unlockVolume("data")
+	if err != nil || !removed {
+		t.Fatalf("first unlock: removed=%v err=%v", removed, err)
+	}
+	removed, err = a.unlockVolume("data")
+	if err != nil || removed {
+		t.Fatalf("second unlock must be idempotent: removed=%v err=%v", removed, err)
+	}
+	if _, err := a.lockVolume("missing", defaultVolumeLockImage); !errors.Is(err, errDockerVolumeNotFound) {
+		t.Fatalf("missing volume lock error: %v", err)
 	}
 }
 

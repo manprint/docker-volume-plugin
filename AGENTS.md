@@ -148,6 +148,13 @@ release blocker, not a style question.
     NFS/CIFS-style `local` options are outside the data-path contract and are
     rejected. `TestVolumeSourceSupportsLocalBindDriverOptions`,
     `TestVolumeSourceRejectsUnsupportedOrRemoteDrivers`.
+19. `docker dvol lock` protects a volume with a running, labelled, read-only
+    guard container. Docker refuses direct/forced removal, prune and Compose
+    removal while the reference exists. Only a guard whose labels and mount
+    match is ignored by the restore in-use check or removed by `unlock`.
+    Lock/unlock are idempotent. `TestVolumeLockLifecycleIsIdempotent`,
+    `TestDockerCLIAdapterCommandsAndParsing`, and the real-Docker lock defect
+    acceptance scenario pin the contract.
 
 ## Quality gates
 
@@ -201,6 +208,8 @@ Rules for new work:
   runs the command.
 - There is deliberately no prune/retention command: deleting a user's backups is
   a destructive feature that needs its own design and confirmation UX.
+- Volume deletion protection uses a Docker guard reference rather than trying
+  to override builtin CLI commands, which Docker CLI plugins cannot do.
 
 ## Known limits
 
@@ -212,5 +221,9 @@ Rules for new work:
 - Backing up a live volume is crash-consistent per file, not point-in-time.
   Quiesce the containers when the application needs a coherent snapshot.
 - The supported operational platform is a local Linux Docker Engine with plain
-  `local` volumes. Docker CLI plugin discovery starts at Docker CLI 19.03, but
-  discovery compatibility does not certify a daemon/filesystem combination.
+  or supported bind-backed `local` volumes. Docker CLI plugin discovery starts
+  at Docker CLI 19.03, but discovery compatibility does not certify a
+  daemon/filesystem combination.
+- Volume locks are an operational safeguard, not an authorization boundary.
+  A Docker administrator can delete the guard container. Compose 5.x reports a
+  protected volume as still in use but may return exit code 0.

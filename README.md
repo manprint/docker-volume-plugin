@@ -1,8 +1,10 @@
 # Docker Volume Backup
 
 `docker dvol` è un’estensione del client Docker per eseguire backup e restore
-dei volumi Docker. Usa il mountpoint reale del volume: non installa un volume
-driver e non copia i dati fuori da Docker durante il normale funzionamento.
+dei volumi Docker e proteggerli dalla rimozione accidentale. Usa il mountpoint
+reale del volume, o il `device` dei bind-backed supportati: non installa un
+volume driver e non copia i dati fuori da Docker durante il normale
+funzionamento.
 
 ```bash
 docker volume create app
@@ -111,6 +113,50 @@ del restore; altrimenti dvol crea volutamente un normale volume `local`.
 docker volume inspect app \
   --format 'name={{.Name}} driver={{.Driver}} mountpoint={{.Mountpoint}}'
 ```
+
+## Protezione dalla cancellazione dei volumi
+
+```bash
+docker dvol lock app
+docker dvol lock app                 # idempotente
+docker dvol unlock app
+```
+
+Elenco dei lock attivi:
+
+```bash
+docker ps --filter label=com.github.fabio.dvol.volume-lock=1 \
+  --format 'table {{.Names}}\t{{.Label "com.github.fabio.dvol.locked-volume"}}'
+```
+
+`lock` crea un piccolo container guardiano che referenzia il volume in sola
+lettura. Il daemon considera quindi il volume “in use” e rifiuta
+`docker volume rm`, `docker volume rm -f`, `docker volume prune` e la rimozione
+del volume eseguita da `docker compose down -v`. Il guard è in esecuzione con
+rete disabilitata, root filesystem read-only, nessuna capability, restart
+policy `unless-stopped` ed etichette `com.github.fabio.dvol.*`. dvol riconosce
+quelle etichette e non confonde il guard con un container applicativo durante
+il controllo precedente al restore.
+
+L'immagine predefinita è `busybox:1.36.1` e può essere sostituita, ad esempio
+in un ambiente offline, con un'immagine locale che fornisca `tail`:
+
+```bash
+docker dvol lock --image registry.example/internal/busybox:1.36.1 app
+```
+
+`unlock` rimuove soltanto il guard correttamente etichettato e non elimina il
+volume. Entrambi i comandi sono idempotenti. Con Docker Compose 5.x,
+`compose down -v` stampa `Resource is still in use` e conserva il volume, ma
+può comunque terminare con exit code 0: il CLI plugin non può modificare la
+politica di uscita di Compose. Gli altri oggetti del progetto (container e
+network) possono essere rimossi normalmente: il lock riguarda esclusivamente
+il volume.
+
+Questo lock protegge dagli errori operativi, non è un confine di
+autorizzazione: chi amministra Docker può rimuovere direttamente il container
+guardiano e poi cancellare il volume. Per un diniego non aggirabile dagli
+utenti Docker servirebbe un authorization plugin configurato sul daemon.
 
 ## Opzioni globali
 

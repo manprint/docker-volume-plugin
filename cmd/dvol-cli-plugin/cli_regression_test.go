@@ -64,6 +64,10 @@ func TestCLIChild(t *testing.T) {
 		a.cmdRestore(spec.Args)
 	case "backup":
 		a.cmdBackup(spec.Args)
+	case "lock":
+		a.cmdLock(spec.Args)
+	case "unlock":
+		a.cmdUnlock(spec.Args)
 	case "compose-backup":
 		a.cmdComposeBackup(spec.Args)
 	case "compose-restore":
@@ -97,6 +101,23 @@ func runChild(t *testing.T, spec childSpec) (stdout, stderr string, code int) {
 		t.Fatalf("running child: %v (stderr: %s)", err, errBuf.String())
 	}
 	return out.String(), errBuf.String(), code
+}
+
+func TestVolumeLockCLIRejectsMissingAndMultipleVolumes(t *testing.T) {
+	root := t.TempDir()
+	_, stderr, code := runChild(t, childSpec{
+		Root: root, Command: "lock", Args: []string{"missing"},
+	})
+	if code == 0 || !strings.Contains(stderr, "docker volume not found") {
+		t.Fatalf("missing volume lock was not rejected: code=%d stderr=%s", code, stderr)
+	}
+
+	_, stderr, code = runChild(t, childSpec{
+		Root: root, Command: "lock", Args: []string{"one", "two"},
+	})
+	if code == 0 || !strings.Contains(stderr, "usage: docker dvol lock") {
+		t.Fatalf("multiple-volume lock was not rejected: code=%d stderr=%s", code, stderr)
+	}
 }
 
 func seedCLIVolume(t *testing.T, store *dvol.Store, name, content string) string {

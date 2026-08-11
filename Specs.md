@@ -9,6 +9,8 @@ permette ai plugin di estendere quei namespace builtin.
 ```text
 docker dvol list
 docker dvol backups <volume>
+docker dvol lock [--image immagine] <volume>
+docker dvol unlock <volume>
 docker dvol backup [opzioni] <volume>...
 docker dvol restore [opzioni] <volume>... [archivio]
 docker dvol verify <volume> [archivio]
@@ -44,6 +46,14 @@ volume.
   vuoti, inutilizzati e con mountpoint invariato.
 - Volumi montati da container attivi: rifiutati salvo `--force`, con controllo
   iniziale e immediatamente precedente al commit.
+- Lock volume: un container guardiano running, read-only e senza rete mantiene
+  una reference Docker al volume. Il daemon rifiuta `volume rm`, anche con
+  `--force`, prune e la rimozione tentata da `compose down -v`. Il guard dvol è
+  escluso dal controllo dei container applicativi. `unlock` verifica etichette
+  e mount prima di rimuoverlo e non rimuove mai il volume.
+- Il lock è una protezione operativa, non un controllo di autorizzazione contro
+  un amministratore del daemon. Compose può segnalare “Resource is still in
+  use” mantenendo comunque exit code 0.
 
 ## Compose
 

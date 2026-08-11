@@ -1,6 +1,6 @@
 // Command dvol-cli-plugin is the Docker CLI plugin `docker-dvol`. It plugs
-// into the `docker` command and exposes volume backup/restore from inside
-// Docker, plus compose-aware single-archive backups.
+// into the `docker` command and exposes volume backup/restore and deletion
+// protection from inside Docker, plus compose-aware single-archive backups.
 //
 // Install as ~/.docker/cli-plugins/docker-dvol to get:
 //
@@ -29,7 +29,7 @@ import (
 
 const (
 	pluginName    = "dvol"
-	pluginVersion = "0.3.0"
+	pluginVersion = "0.4.0"
 	metadataCmd   = "docker-cli-plugin-metadata"
 )
 
@@ -113,6 +113,10 @@ func main() {
 		a.cmdList(args[1:])
 	case "backups":
 		a.cmdBackups(args[1:])
+	case "lock":
+		a.cmdLock(args[1:])
+	case "unlock":
+		a.cmdUnlock(args[1:])
 	case "backup":
 		a.cmdBackup(args[1:])
 	case "restore":
@@ -138,7 +142,7 @@ func defaultBackupRoot() string {
 }
 
 func printMetadata() {
-	fmt.Println(`{"SchemaVersion":"0.1.0","Vendor":"fabio","Version":"` + pluginVersion + `","ShortDescription":"Backup and restore Docker volumes (also from Docker Compose)"}`)
+	fmt.Println(`{"SchemaVersion":"0.1.0","Vendor":"fabio","Version":"` + pluginVersion + `","ShortDescription":"Backup, restore and protect Docker volumes"}`)
 }
 
 func parseArchiveMode(value string) (os.FileMode, error) {
@@ -498,6 +502,66 @@ func (a *app) cmdBackups(args []string) {
 	if err := tw.Flush(); err != nil {
 		fail(err)
 	}
+}
+
+func (a *app) lockVolume(name, image string) (bool, error) {
+	if a.docker == nil {
+		return false, errors.New("docker CLI is required")
+	}
+	info, err := a.docker.Inspect(name)
+	if err != nil {
+		return false, err
+	}
+	if _, err := validateVolumeSource(name, info); err != nil {
+		return false, err
+	}
+	return a.docker.LockVolume(name, image)
+}
+
+func (a *app) unlockVolume(name string) (bool, error) {
+	if a.docker == nil {
+		return false, errors.New("docker CLI is required")
+	}
+	return a.docker.UnlockVolume(name)
+}
+
+// cmdLock: docker dvol lock [--image image] <volume>
+func (a *app) cmdLock(args []string) {
+	fs := flag.NewFlagSet("lock", flag.ContinueOnError)
+	image := fs.String("image", defaultVolumeLockImage, "container image for the lock guard")
+	if err := fs.Parse(args); err != nil {
+		fail(err)
+	}
+	names := expandNames(fs.Args())
+	if len(names) != 1 {
+		fail("usage: docker dvol lock [--image image] <volume>")
+	}
+	created, err := a.lockVolume(names[0], *image)
+	if err != nil {
+		fail(err)
+	}
+	if created {
+		fmt.Printf("locked Docker volume %s\n", names[0])
+		return
+	}
+	fmt.Printf("Docker volume %s is already locked\n", names[0])
+}
+
+// cmdUnlock: docker dvol unlock <volume>
+func (a *app) cmdUnlock(args []string) {
+	names := expandNames(args)
+	if len(names) != 1 {
+		fail("usage: docker dvol unlock <volume>")
+	}
+	removed, err := a.unlockVolume(names[0])
+	if err != nil {
+		fail(err)
+	}
+	if removed {
+		fmt.Printf("unlocked Docker volume %s\n", names[0])
+		return
+	}
+	fmt.Printf("Docker volume %s is already unlocked\n", names[0])
 }
 
 // cmdVerify: docker dvol verify <volume> [backup] | docker dvol verify --archive <path>
@@ -1006,6 +1070,8 @@ func (a *app) usage() {
 Usage:
   docker dvol list                          list volumes
   docker dvol backups <volume>              list backups of a volume
+  docker dvol lock [--image image] <volume> protect a volume from Docker removal
+  docker dvol unlock <volume>                remove dvol's protection reference
   docker dvol backup [options] <volume>...  back up one or more volumes
   docker dvol restore [options] <volume>... [backup]
   docker dvol verify <volume> [backup] | verify --archive <path>

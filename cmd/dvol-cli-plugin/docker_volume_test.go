@@ -42,8 +42,28 @@ case "$1 $2" in
       *) printf '%s\n' "$3" ;;
     esac
     ;;
+  "container inspect")
+    case "$5" in
+      app-id-1) printf '{"ID":"app-id-1","Name":"/app-1","Config":{"Labels":{}},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"alpha","Destination":"/data","RW":true}]}\n' ;;
+      app-id-2) printf '{"ID":"app-id-2","Name":"/app-2","Config":{"Labels":{}},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"alpha","Destination":"/data","RW":true}]}\n' ;;
+      lock-id-alpha|__ALPHA_GUARD__) printf '{"ID":"lock-id-alpha","Name":"/__ALPHA_GUARD__","Config":{"Labels":{"com.github.fabio.dvol.volume-lock":"1","com.github.fabio.dvol.locked-volume":"alpha"}},"State":{"Running":true},"Mounts":[{"Type":"volume","Name":"alpha","Destination":"/dvol-lock","RW":false}]}\n' ;;
+      __STOPPED_GUARD__) printf '{"ID":"lock-id-stopped","Name":"/__STOPPED_GUARD__","Config":{"Labels":{"com.github.fabio.dvol.volume-lock":"1","com.github.fabio.dvol.locked-volume":"stopped"}},"State":{"Running":false},"Mounts":[{"Type":"volume","Name":"stopped","Destination":"/dvol-lock","RW":false}]}\n' ;;
+      __COLLISION_GUARD__) printf '{"ID":"collision","Name":"/__COLLISION_GUARD__","Config":{"Labels":{}},"State":{"Running":true},"Mounts":[]}\n' ;;
+      malformed-container) printf '{not-json}\n' ;;
+      *) printf 'Error: No such container: %s\n' "$5" >&2; exit 1 ;;
+    esac
+    ;;
+  "container create")
+    printf 'created-lock-id\n'
+    ;;
+  "container start")
+    printf '%s\n' "$3"
+    ;;
+  "container rm")
+    printf '%s\n' "$4"
+    ;;
   "ps --filter")
-    printf 'app-1\napp-2\n'
+    printf 'app-id-1\nlock-id-alpha\napp-id-2\ngone-id\n'
     ;;
   *)
     printf 'unexpected fake Docker arguments\n' >&2
@@ -51,6 +71,9 @@ case "$1 $2" in
     ;;
 esac
 `
+	script = strings.ReplaceAll(script, "__ALPHA_GUARD__", volumeLockContainerName("alpha"))
+	script = strings.ReplaceAll(script, "__STOPPED_GUARD__", volumeLockContainerName("stopped"))
+	script = strings.ReplaceAll(script, "__COLLISION_GUARD__", volumeLockContainerName("collision"))
 	if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +114,30 @@ func TestDockerCLIAdapterCommandsAndParsing(t *testing.T) {
 		t.Fatalf("non-not-found remove failure was hidden: %v", err)
 	}
 
+	createdLock, err := cli.LockVolume("fresh", "busybox:test")
+	if err != nil || !createdLock {
+		t.Fatalf("create lock: created=%v err=%v", createdLock, err)
+	}
+	createdLock, err = cli.LockVolume("alpha", "ignored:test")
+	if err != nil || createdLock {
+		t.Fatalf("existing lock must be idempotent: created=%v err=%v", createdLock, err)
+	}
+	createdLock, err = cli.LockVolume("stopped", "ignored:test")
+	if err != nil || createdLock {
+		t.Fatalf("stopped lock must be restarted in place: created=%v err=%v", createdLock, err)
+	}
+	removedLock, err := cli.UnlockVolume("alpha")
+	if err != nil || !removedLock {
+		t.Fatalf("unlock: removed=%v err=%v", removedLock, err)
+	}
+	removedLock, err = cli.UnlockVolume("missing")
+	if err != nil || removedLock {
+		t.Fatalf("missing unlock must be idempotent: removed=%v err=%v", removedLock, err)
+	}
+	if _, err := cli.LockVolume("collision", "ignored:test"); err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("unmanaged lock-name collision was accepted: %v", err)
+	}
+
 	containers, err := cli.ContainersUsing("alpha")
 	if err != nil || !reflect.DeepEqual(containers, []string{"app-1", "app-2"}) {
 		t.Fatalf("containers using volume: names=%v err=%v", containers, err)
@@ -106,7 +153,11 @@ func TestDockerCLIAdapterCommandsAndParsing(t *testing.T) {
 		"CALL\tvolume\tls\t--quiet",
 		"CALL\tvolume\tcreate\t--label\tcom.github.fabio.dvol.restore-owner=test-owner\t--name\tcreated",
 		"CALL\tvolume\trm\tcreated",
-		"CALL\tps\t--filter\tvolume=alpha\t--format\t{{.Names}}",
+		"CALL\tcontainer\tcreate\t--name\t" + volumeLockContainerName("fresh"),
+		"CALL\tcontainer\tstart\t" + volumeLockContainerName("fresh"),
+		"CALL\tcontainer\tstart\t" + volumeLockContainerName("stopped"),
+		"CALL\tcontainer\trm\t--force\t" + volumeLockContainerName("alpha"),
+		"CALL\tps\t--filter\tvolume=alpha\t--format\t{{.ID}}",
 	} {
 		if !strings.Contains(logText, want) {
 			t.Errorf("Docker invocation %q missing from log:\n%s", want, logText)
