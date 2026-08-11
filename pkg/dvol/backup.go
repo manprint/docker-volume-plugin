@@ -337,8 +337,16 @@ func writeArchiveWithProgress(path string, mode os.FileMode, opts BackupOptions,
 }
 
 func writeArchiveWithProgressOps(path string, mode os.FileMode, opts BackupOptions, progress *Progress, populate func(*tar.Writer) error, publish archivePublicationOps) error {
+	// Coordinate temp-file creation with the stale-temp sweep. Without this
+	// short lock, a sweeper can observe the file after CreateTemp but before the
+	// writer has acquired its file lock and remove an active archive.
+	tempLock, err := lockTempArchiveDirectory(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
 	f, err := os.CreateTemp(filepath.Dir(path), tempArchivePrefix+"*")
 	if err != nil {
+		unlockTempArchiveDirectory(tempLock)
 		return err
 	}
 	tmp := f.Name()
@@ -348,8 +356,10 @@ func writeArchiveWithProgressOps(path string, mode os.FileMode, opts BackupOptio
 	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
+		unlockTempArchiveDirectory(tempLock)
 		return err
 	}
+	unlockTempArchiveDirectory(tempLock)
 	cleanup := func() {
 		_ = f.Close()
 		_ = os.Remove(tmp)
@@ -398,11 +408,42 @@ func writeArchiveWithProgressOps(path string, mode os.FileMode, opts BackupOptio
 }
 
 const tempArchivePrefix = ".dvol-backup-"
+const tempArchiveLockName = ".dvol-temp.lock"
+
+func lockTempArchiveDirectory(dir string) (*os.File, error) {
+	// Keep the coordination inode beside (rather than inside) the archive
+	// directory. The archive directory must contain only published archives and
+	// in-progress files, and callers may inspect it after a failed backup.
+	lockPath := filepath.Join(filepath.Dir(dir), tempArchiveLockName)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func unlockTempArchiveDirectory(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = unix.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
 
 // sweepStaleTempArchives removes temporary archives abandoned by a crashed
 // backup. A temporary file another process is still writing keeps an exclusive
 // lock and is left alone.
 func (s *Store) sweepStaleTempArchives(dir string) {
+	tempLock, err := lockTempArchiveDirectory(dir)
+	if err != nil {
+		return
+	}
+	defer unlockTempArchiveDirectory(tempLock)
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
