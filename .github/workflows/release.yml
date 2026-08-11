@@ -109,6 +109,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" release/docker-dvol-* release/SHA256SUMS.txt \
+          gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" release/docker-dvol-* release/SHA256SUMS.txt \
             --title "dvol ${GITHUB_REF_NAME}" \
             --generate-notes
