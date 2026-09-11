@@ -698,6 +698,13 @@ func (a *app) cmdBackup(args []string) {
 		if len(archiveNames) > 1 || (len(archiveNames) == 1 && strings.Contains(archiveNames[0], "::")) {
 			fail("--archive-name with --bundle accepts one bundle name, not volume::name mappings")
 		}
+		if sameDestination {
+			// A bundle is always written to <destination>/compose. Accepting the
+			// flag and ignoring it told the operator the archive had landed
+			// somewhere it had not, which only surfaces when a restore cannot
+			// find it.
+			fail("--same-destination does not apply to --bundle: a bundle is always written to the compose directory")
+		}
 		prefix := "volumes"
 		if len(archiveNames) == 1 {
 			opts.ArchiveName = archiveNames[0]

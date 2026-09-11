@@ -38,6 +38,11 @@ volume.
 - Pubblicazione backup: file temporaneo privato, sync, link/rename atomico e
   sync della directory. Un errore successivo alla pubblicazione è tipizzato e
   riporta il percorso completo da verificare.
+- File di controllo: indice, lock e temporanei stanno dentro la directory degli
+  archivi. dvol non scrive nulla nella directory padre della destinazione, che
+  può quindi essere di sola lettura.
+- Client Docker: dvol interpreta solo lo standard output del comando `docker`;
+  gli avvisi su standard error non alterano la decodifica.
 - Restore: estrazione e validazione complete in staging; metadati stretti per
   default, con `--best-effort-metadata` come opt-in esplicito.
 - Restore bundle: tutti gli staging sono preparati prima degli swap e un journal
@@ -67,6 +72,13 @@ La precedenza del nome progetto è:
 È accettato un solo file `-f`. dvol non implementa merge, interpolazione o
 profili Compose: per quei casi occorre passare l’output materializzato di
 `docker compose config`.
+
+## Toolchain
+
+Go 1.27.1, fissato dalla direttiva `go` in `go.mod` e usato anche dalla CI
+tramite `go-version-file`. Dipendenze dirette: `klauspost/compress`,
+`klauspost/pgzip`, `pierrec/lz4/v4`, `ulikunitz/xz`, `golang.org/x/sys`,
+`gopkg.in/yaml.v3`.
 
 ## Fuori scope
 

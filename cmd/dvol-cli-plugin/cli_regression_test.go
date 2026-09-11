@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -618,5 +619,105 @@ func TestCLIRejectsArgumentsItWouldOtherwiseIgnore(t *testing.T) {
 func TestResolveComposeFileRejectsSilentlyIgnoredOverrides(t *testing.T) {
 	if _, err := resolveComposeFile([]string{"compose.yaml", "override.yaml"}); err == nil || !strings.Contains(err.Error(), "multiple -f") {
 		t.Fatalf("multiple compose files must be rejected explicitly, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-11 review — R5: the Docker CLI was run with CombinedOutput, so every
+// advisory line Docker writes to stderr on a healthy daemon ("WARNING: ..."
+// about API version negotiation, deprecated configuration, credential helpers)
+// landed in the middle of the JSON handed to the decoder or in the volume list
+// handed to Inspect. A plain `docker dvol list` then failed with
+// `invalid character 'W' looking for beginning of value`.
+// ---------------------------------------------------------------------------
+
+// warningDockerCommand writes a warning to stderr before every answer, exactly
+// as a real Docker CLI does.
+func warningDockerCommand(t *testing.T) *dockerCLI {
+	t.Helper()
+	dir := t.TempDir()
+	command := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+printf 'WARNING: API version negotiation failed, using default\n' >&2
+case "$1 $2" in
+  "volume ls") printf 'alpha\n' ;;
+  "volume inspect")
+    case "$5" in
+      alpha) printf '{"Name":"alpha","Driver":"local","Mountpoint":"/var/lib/docker/volumes/alpha/_data","Options":{}}\n' ;;
+      *) printf 'Error response from daemon: get %s: no such volume\n' "$5" >&2; exit 1 ;;
+    esac
+    ;;
+  "ps --filter") printf '' ;;
+  *) printf 'unexpected arguments\n' >&2; exit 2 ;;
+esac
+`
+	if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return &dockerCLI{command: command}
+}
+
+func TestDockerCLIIgnoresWarningsOnStandardError(t *testing.T) {
+	cli := warningDockerCommand(t)
+
+	info, err := cli.Inspect("alpha")
+	if err != nil {
+		t.Fatalf("a stderr warning must not break volume inspection: %v", err)
+	}
+	if info.Mountpoint != "/var/lib/docker/volumes/alpha/_data" {
+		t.Fatalf("mountpoint = %q", info.Mountpoint)
+	}
+
+	volumes, err := cli.List()
+	if err != nil {
+		t.Fatalf("a stderr warning must not break volume listing: %v", err)
+	}
+	if len(volumes) != 1 || volumes[0].Name != "alpha" {
+		t.Fatalf("volumes = %+v, want exactly alpha", volumes)
+	}
+
+	using, err := cli.ContainersUsing("alpha")
+	if err != nil {
+		t.Fatalf("a stderr warning must not break the in-use check: %v", err)
+	}
+	if len(using) != 0 {
+		t.Fatalf("containers = %v, want none", using)
+	}
+}
+
+// The failure diagnostics Docker writes to stderr must still reach the
+// operator, and still classify a missing volume.
+func TestDockerCLIStillReportsStandardErrorDiagnostics(t *testing.T) {
+	cli := warningDockerCommand(t)
+	_, err := cli.Inspect("ghost")
+	if !errors.Is(err, errDockerVolumeNotFound) {
+		t.Fatalf("err = %v, want errDockerVolumeNotFound", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-11 review — R6: `backup --bundle --same-destination` accepted the
+// flag and ignored it. The bundle went to <destination>/compose while the
+// operator was told it had landed in the destination itself, and the gap only
+// surfaced when a restore could not find the archive.
+// ---------------------------------------------------------------------------
+
+func TestBundleBackupRejectsSameDestination(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(t.TempDir(), "web")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code := runChild(t, childSpec{
+		Root:    root,
+		Volumes: map[string]string{"web": source},
+		Command: "backup",
+		Args:    []string{"--bundle", "--same-destination", "web"},
+	})
+	if code == 0 {
+		t.Fatal("--same-destination was silently ignored with --bundle")
+	}
+	if !strings.Contains(stderr, "--same-destination does not apply to --bundle") {
+		t.Fatalf("stderr = %q, want the flag conflict named", stderr)
 	}
 }

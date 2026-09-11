@@ -411,10 +411,17 @@ const tempArchivePrefix = ".dvol-backup-"
 const tempArchiveLockName = ".dvol-temp.lock"
 
 func lockTempArchiveDirectory(dir string) (*os.File, error) {
-	// Keep the coordination inode beside (rather than inside) the archive
-	// directory. The archive directory must contain only published archives and
-	// in-progress files, and callers may inspect it after a failed backup.
-	lockPath := filepath.Join(filepath.Dir(dir), tempArchiveLockName)
+	// The coordination inode lives inside the archive directory, next to the
+	// temporary files it coordinates. Keeping it in the parent instead made a
+	// backup fail outright whenever the destination was writable but its parent
+	// was not, which is the ordinary shape of a mounted backup share
+	// (/mnt/nas owned by root, /mnt/nas/backups owned by the operator). It also
+	// wrote dvol state into a directory dvol was never pointed at. Listings
+	// ignore it: it carries neither an archive suffix nor the temporary prefix.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(dir, tempArchiveLockName)
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -855,7 +862,7 @@ func walkReadOnlyDir(dir *os.File, dirPath, prefix string, opts readOptions, vis
 					}
 					return err
 				}
-				entry.xattrs, err = readPathXattrs(path)
+				entry.xattrs, err = readPathXattrs(path, opts.logger)
 				if err != nil {
 					return fmt.Errorf("read extended attributes of symlink %q: %w", path, err)
 				}
@@ -885,7 +892,7 @@ func walkReadOnlyDir(dir *os.File, dirPath, prefix string, opts readOptions, vis
 					return closeErr
 				}
 			default:
-				entry.xattrs, err = readPathXattrs(path)
+				entry.xattrs, err = readPathXattrs(path, opts.logger)
 				if err != nil {
 					return fmt.Errorf("read extended attributes of special entry %q: %w", path, err)
 				}
@@ -987,7 +994,7 @@ func (s *Store) addTree(tw *tar.Writer, dir, prefix string, progress *Progress) 
 		hdr.Format = tar.FormatPAX
 		attrs := entry.xattrs
 		if entry.file != nil {
-			attrs, err = readXattrs(int(entry.file.Fd()))
+			attrs, err = readXattrs(int(entry.file.Fd()), entry.path, opts.logger)
 			if err != nil {
 				return fmt.Errorf("read extended attributes of %q: %w", entry.path, err)
 			}
@@ -1114,7 +1121,7 @@ func dirHeader(name string, info os.FileInfo, path string, opts readOptions) (*t
 		return nil, err
 	}
 	defer dir.Close()
-	attrs, err := readXattrs(int(dir.Fd()))
+	attrs, err := readXattrs(int(dir.Fd()), path, opts.logger)
 	if err != nil {
 		return nil, err
 	}

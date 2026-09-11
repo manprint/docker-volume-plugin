@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -73,12 +74,28 @@ type dockerCLI struct {
 
 func newDockerCLI() dockerVolumeClient { return &dockerCLI{command: "docker"} }
 
+// run executes the Docker CLI and returns its standard output only.
+//
+// Merging the two streams was wrong in both directions. The Docker CLI writes
+// advisory lines to stderr on a perfectly healthy daemon ("WARNING: ..." about
+// API version negotiation, deprecated configuration, credential helpers), and
+// every one of them landed in the middle of the JSON handed to the decoder or
+// in the volume list handed to `Inspect`: a plain `docker dvol list` failed
+// with `invalid character 'W' looking for beginning of value`. Diagnostics
+// still reach the operator, through the error message of a failed command.
 func (c *dockerCLI) run(args ...string) ([]byte, error) {
-	out, err := exec.Command(c.command, args...).CombinedOutput()
-	if err != nil {
-		return out, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	cmd := exec.Command(c.command, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		details := strings.TrimSpace(stderr.String())
+		if details == "" {
+			details = strings.TrimSpace(stdout.String())
+		}
+		return stdout.Bytes(), fmt.Errorf("%w: %s", err, details)
 	}
-	return out, nil
+	return stdout.Bytes(), nil
 }
 
 func (c *dockerCLI) Inspect(name string) (dockerVolumeInfo, error) {

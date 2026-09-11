@@ -11,8 +11,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func seedVolume(t *testing.T, s *Store, name, content string) {
@@ -367,5 +370,165 @@ func TestConcurrentCreateHasSingleWinner(t *testing.T) {
 	}
 	if _, err := s.Get("shared"); err != nil {
 		t.Fatalf("winning metadata is unreadable: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-11 review — R3: os.CreateTemp publishes a journal record's name
+// before its owner can flock it. A NewStore running in another process scanned
+// the journal directory, found a record it could lock that carried no complete
+// line, and removed it as a crash leftover. The owner then either failed with a
+// bare "lock replacement journal: resource temporarily unavailable" — aborting
+// an otherwise valid restore — or kept writing to an unlinked inode, leaving
+// the swap unjournalled and therefore unrecoverable, which is the crash window
+// invariant 14 exists to close.
+// ---------------------------------------------------------------------------
+
+// withJournalCreateHook installs the fault-injection seam for one test.
+func withJournalCreateHook(t *testing.T, hook func(path string)) {
+	t.Helper()
+	journalCreateHook = hook
+	t.Cleanup(func() { journalCreateHook = nil })
+}
+
+func TestJournalRecordSurvivesConcurrentRecoveryRemovingIt(t *testing.T) {
+	s := newTestStore(t)
+	stolen := 0
+	withJournalCreateHook(t, func(path string) {
+		// Exactly what a recovery pass does to a record with no complete line.
+		if stolen == 0 {
+			stolen++
+			if err := os.Remove(path); err != nil {
+				t.Errorf("simulating recovery: %v", err)
+			}
+		}
+	})
+	staging := filepath.Join(t.TempDir(), "stage")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.beginStaging(staging)
+	if err != nil {
+		t.Fatalf("beginStaging must claim another name, not fail: %v", err)
+	}
+	defer rec.discard()
+	if stolen != 1 {
+		t.Fatalf("the race was not exercised (stolen=%d)", stolen)
+	}
+	if _, err := os.Stat(rec.path); err != nil {
+		t.Fatalf("journal record is not on disk, so a crash would be unrecoverable: %v", err)
+	}
+}
+
+func TestJournalRecordSurvivesConcurrentRecoveryLockingIt(t *testing.T) {
+	s := newTestStore(t)
+	held := []*os.File(nil)
+	t.Cleanup(func() {
+		for _, f := range held {
+			_ = f.Close()
+		}
+	})
+	locked := 0
+	withJournalCreateHook(t, func(path string) {
+		// A recovery pass that has taken the lock and not yet removed the file.
+		if locked > 0 {
+			return
+		}
+		locked++
+		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+		if err != nil {
+			t.Errorf("simulating recovery: %v", err)
+			return
+		}
+		if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Errorf("simulating recovery lock: %v", err)
+		}
+		held = append(held, f)
+	})
+	staging := filepath.Join(t.TempDir(), "stage")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := s.beginStaging(staging)
+	if err != nil {
+		t.Fatalf("beginStaging must claim another name, not fail: %v", err)
+	}
+	defer rec.discard()
+	if locked != 1 {
+		t.Fatalf("the race was not exercised (locked=%d)", locked)
+	}
+	if _, err := os.Stat(rec.path); err != nil {
+		t.Fatalf("journal record is not on disk: %v", err)
+	}
+}
+
+func TestReplacementGroupSurvivesConcurrentRecoveryRemovingIt(t *testing.T) {
+	s := newTestStore(t)
+	stolen := 0
+	withJournalCreateHook(t, func(path string) {
+		if stolen == 0 && strings.Contains(filepath.Base(path), "group-") {
+			stolen++
+			if err := os.Remove(path); err != nil {
+				t.Errorf("simulating recovery: %v", err)
+			}
+		}
+	})
+	group, err := s.beginReplacementGroup()
+	if err != nil {
+		t.Fatalf("beginReplacementGroup must claim another name, not fail: %v", err)
+	}
+	defer group.discard()
+	if stolen != 1 {
+		t.Fatalf("the race was not exercised (stolen=%d)", stolen)
+	}
+	// A group whose commit marker is not on disk reads as "never committed",
+	// which would roll back every member of a completed bundle restore.
+	if _, err := os.Stat(group.path); err != nil {
+		t.Fatalf("replacement group marker is not on disk: %v", err)
+	}
+}
+
+// TestConcurrentStoreOpensDoNotStealInFlightJournalRecords is the unseeded
+// form of the same defect: another dvol process merely starting up must not
+// break a restore that is registering its staging directory.
+func TestConcurrentStoreOpensDoNotStealInFlightJournalRecords(t *testing.T) {
+	s := newTestStore(t)
+	root := s.cfg.Root
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := NewStore(Config{Root: root}); err != nil {
+				t.Errorf("concurrent NewStore: %v", err)
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	base := t.TempDir()
+	for i := 0; i < 300; i++ {
+		staging := filepath.Join(base, fmt.Sprintf("stage-%d", i))
+		if err := os.MkdirAll(staging, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		rec, err := s.beginStaging(staging)
+		if err != nil {
+			t.Fatalf("iteration %d: a concurrent store open broke the journal record: %v", i, err)
+		}
+		if _, err := os.Stat(rec.path); err != nil {
+			t.Fatalf("iteration %d: journal record was removed while in flight: %v", i, err)
+		}
+		rec.discard()
 	}
 }

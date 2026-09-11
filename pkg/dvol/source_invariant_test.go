@@ -310,8 +310,15 @@ func TestBackupInterruptionKeepsSourceAndExistingArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != filepath.Base(final) {
-		t.Fatalf("temporary archive was left behind after interruption: %v", entries)
+	// Only the pre-existing archive and dvol's temp-file coordination lock may
+	// remain: a partial archive under any other name is the failure this test
+	// exists to catch.
+	for _, entry := range entries {
+		switch entry.Name() {
+		case filepath.Base(final), tempArchiveLockName:
+		default:
+			t.Fatalf("temporary archive was left behind after interruption: %v", entries)
+		}
 	}
 }
 

@@ -1308,3 +1308,121 @@ func TestSparseWriterPreservesArbitraryContent(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 2026-09-11 review — R1: the temporary-archive coordination lock was created
+// in the *parent* of the archive directory, so a backup into a writable
+// destination failed outright whenever its parent was not writable (the usual
+// shape of a mounted backup share: /mnt/nas owned by root, /mnt/nas/backups
+// owned by the operator). It also wrote dvol state outside the directory dvol
+// was pointed at.
+// ---------------------------------------------------------------------------
+
+func TestBackupSucceedsWhenDestinationParentIsNotWritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	base := t.TempDir()
+	parent := filepath.Join(base, "share")
+	destination := filepath.Join(parent, "backups")
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(base, "src")
+	writeVolumeFile(t, source, "data.txt", "payload")
+	if err := os.Chmod(parent, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+
+	s, err := NewStore(Config{Root: filepath.Join(base, "root"), BackupsDir: destination})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []BackupOptions{{SameDestination: true}, {}} {
+		path, err := s.BackupSourceWithOptions("web", source, opts)
+		if err != nil {
+			t.Fatalf("backup into a writable destination failed (same-destination=%v): %v", opts.SameDestination, err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("archive missing: %v", err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(parent, tempArchiveLockName)); !os.IsNotExist(err) {
+		t.Fatalf("dvol wrote its coordination lock outside the destination: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(destination, tempArchiveLockName)); err != nil {
+		t.Fatalf("coordination lock not kept inside the destination: %v", err)
+	}
+}
+
+// The lock file must never be mistaken for a backup.
+func TestTemporaryArchiveLockIsNotListedAsABackup(t *testing.T) {
+	s := newTestStore(t)
+	seedVolume(t, s, "web", "payload")
+	if _, err := s.BackupSourceWithOptions("web", s.VolumePath("web"), BackupOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := s.ListBackups("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("expected exactly the published archive, got %d entries: %+v", len(infos), infos)
+	}
+	if infos[0].Name == tempArchiveLockName {
+		t.Fatalf("coordination lock listed as a backup")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2026-09-11 review — R2: ERANGE from the list/get xattr pair means "the
+// attribute set changed between sizing and reading", not "xattrs are
+// unsupported". Classifying it as unsupported silently dropped every extended
+// attribute of the entry — hence its POSIX ACL and its file capabilities —
+// from the archive, exactly the silent fidelity loss invariant 12 forbids.
+// ---------------------------------------------------------------------------
+
+func TestXattrReadRetriesWhenTheAttributeSetGrows(t *testing.T) {
+	sizes := []int{4, 4, 9}
+	calls := 0
+	value, err := readSizedXattr(
+		func() (int, error) {
+			n := sizes[min(calls, len(sizes)-1)]
+			return n, nil
+		},
+		func(buf []byte) (int, error) {
+			calls++
+			if len(buf) < 9 {
+				return 0, unix.ERANGE
+			}
+			return copy(buf, "principal"), nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("a growing attribute set must be retried, not reported: %v", err)
+	}
+	if string(value) != "principal" {
+		t.Fatalf("value = %q, want %q", value, "principal")
+	}
+}
+
+func TestXattrReadGivesUpAfterPersistentResizing(t *testing.T) {
+	if _, err := readSizedXattr(
+		func() (int, error) { return 4, nil },
+		func([]byte) (int, error) { return 0, unix.ERANGE },
+	); !errors.Is(err, unix.ERANGE) {
+		t.Fatalf("err = %v, want ERANGE after exhausting the retries", err)
+	}
+}
+
+func TestXattrReadStillTreatsUnsupportedFilesystemsAsEmpty(t *testing.T) {
+	if xattrsUnsupported(unix.ERANGE) {
+		t.Fatal("ERANGE must not be classified as an unsupported filesystem")
+	}
+	for _, err := range []error{unix.ENOTSUP, unix.EOPNOTSUPP, unix.ENODATA, unix.EACCES, unix.EPERM} {
+		if !xattrsUnsupported(err) {
+			t.Fatalf("%v must stay classified as unsupported", err)
+		}
+	}
+}

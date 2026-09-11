@@ -46,6 +46,10 @@ func (w *sparseFileWriter) Write(p []byte) (int, error) {
 		p = p[n:]
 		if len(w.buf) == sparseChunk {
 			if err := w.flushChunk(); err != nil {
+				// A failed chunk flush leaves an indeterminate prefix on disk
+				// and the buffer unconsumed, so no byte of p can be claimed as
+				// written. The writer is not resumable after this: every caller
+				// abandons the file (and the whole restore) on the error.
 				return 0, err
 			}
 		}

@@ -19,7 +19,8 @@ volumi creati prima dell’installazione.
 
 - Linux, Docker Engine locale e Docker CLI 19.03 o superiore sull’host che
   esegue il comando;
-- Go 1.26.2 o superiore per compilare il progetto;
+- Go 1.27.1 o superiore per compilare il progetto (la versione è fissata dalla
+  direttiva `go` in `go.mod` e usata anche dalla CI);
 - permessi di lettura/scrittura sul mountpoint Docker;
 - volumi con driver `local` normali oppure bind-backed con opzioni
   `type=none`, `device=<percorso assoluto>`, `o=bind` (è ammesso anche `rw`);
@@ -31,6 +32,14 @@ scoperto dal client, ma backup e restore vengono rifiutati o non sono
 supportati. I volumi bind-backed locali sono risolti al loro `device` host;
 volumi NFS/CIFS creati tramite opzioni del driver `local` e driver di terze
 parti sono invece rifiutati.
+
+### Output del client Docker
+
+dvol interroga il daemon tramite il client `docker` e legge soltanto il suo
+standard output. Gli avvisi che il client scrive su standard error (per esempio
+`WARNING: API version negotiation failed`) non interferiscono quindi con la
+decodifica: restano diagnostica e vengono riportati solo quando il comando
+Docker fallisce davvero.
 
 ### Compatibilità Docker CLI
 
@@ -265,7 +274,10 @@ Opzioni di `backup`:
                               con più volumi: VOLUME::NOME
 --name VALUE                  alias di --archive-name
 --same-destination            salva gli archivi direttamente in <destination>;
-                              default: false, mantiene <destination>/<volume>/
+                              default: false, mantiene <destination>/<volume>/;
+                              incompatibile con --bundle (un bundle finisce
+                              sempre in <destination>/compose) e viene rifiutato
+                              invece di essere ignorato
 --timestamp                   aggiunge _ddmmyyyy_HHMMSS; default: false
 --timestamp-utc               usa UTC per --timestamp; default: timezone locale
 --overwrite                   sostituisce un archivio locale esistente;
@@ -451,7 +463,16 @@ mantiene una prenotazione `.dvol-reserve-<archivio>.lock`. Il lock dell’indice
 non viene mai tenuto per tutta la scrittura dell’archivio, quindi `docker dvol
 backups` risponde anche durante un backup lungo; la prenotazione impedisce a due
 processi di scrivere lo stesso nome e permette di distinguere un backup vivo da
-uno interrotto. Gli archivi flat già pubblicati vengono recuperati anche se il
+uno interrotto.
+
+Tutti i file di controllo di dvol stanno **dentro** la directory degli archivi:
+`.dvol-index.json`, `.dvol-index.lock`, `.dvol-reserve-<archivio>.lock`,
+`.dvol-temp.lock` (coordina i file temporanei con la pulizia di quelli
+abbandonati) e i temporanei `.dvol-backup-*` in corso di scrittura. dvol non
+scrive nulla nella directory padre della destinazione: basta che la
+destinazione sia scrivibile, anche se il suo padre non lo è (per esempio
+`/mnt/nas` di root e `/mnt/nas/backups` dell’operatore). Nessuno di questi file
+compare in `docker dvol backups`. Gli archivi flat già pubblicati vengono recuperati anche se il
 processo si interrompe durante l’aggiornamento dei metadati, e una voce di
 indice illeggibile viene scartata con un avviso senza bloccare né l’elenco né i
 backup successivi.
@@ -773,6 +794,13 @@ il restore fallisce e il volume live resta invariato. Solo l’opt-in globale
 `--best-effort-metadata` converte questi errori in warning e permette un restore
 consapevolmente non fedele.
 
+Anche in lettura gli attributi estesi non vengono mai persi in silenzio: se il
+set di attributi cambia fra la chiamata che ne misura la dimensione e quella
+che li legge, la lettura viene ripetuta; un attributo che il processo non ha il
+diritto di leggere produce un warning con il nome dell’attributo e il percorso,
+non una rimozione silenziosa dall’archivio. Un filesystem senza supporto xattr
+resta invece un caso normale e non produce rumore.
+
 In caso di crash durante il backup:
 
 - il volume sorgente non viene modificato;
@@ -815,6 +843,14 @@ mountpoint Docker fuori dal repository, e i record ancora in uso da un altro
 processo vengono saltati: due comandi dvol contemporanei non si disturbano. I
 record dei bundle condividono inoltre un marker di commit durevole, così il
 recupero prende una sola decisione per l’intero gruppo.
+
+La riparazione parte a ogni avvio, quindi anche un comando innocuo come
+`docker dvol backups` apre il journal mentre un restore è in corso. Il record
+viene creato e bloccato con un protocollo che tollera questa corsa: chi crea il
+record riprova con un altro nome se nel frattempo una riparazione se l’è preso,
+e la riparazione ignora un record che il proprietario ha nel frattempo
+completato e rimosso. Un secondo processo dvol non può quindi né far fallire un
+restore in corso né fallire a sua volta.
 
 Il risultato è che il dato non può sparire: dopo un restore interrotto il volume
 contiene o il contenuto precedente o quello ripristinato, mai nulla.
@@ -867,8 +903,9 @@ make clean
 
 `make check` è il gate da superare prima di ogni commit; `sudo make acceptance`
 prima di ogni modifica che tocchi backup, restore o il contratto della CLI.
-Architettura, invarianti e regole per i test sono in `AGENTS.md`; l’audit da cui
-derivano è in `REVIEW.md`.
+Architettura, invarianti e regole per i test sono in `AGENTS.md`; gli audit da
+cui derivano sono in `REVIEW.md` (2026-08-08), `QA_REVIEW_2026-08-11.md` e
+`REVIEW_2026-09-11.md`.
 
 Il target va eseguito dalla directory root del repository, non da
 `test/acceptance/`. In alternativa, da una sottodirectory usare

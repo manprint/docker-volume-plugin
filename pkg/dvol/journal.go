@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,18 +68,91 @@ type replacementGroup struct {
 	preserve bool
 }
 
+// journalCreateHook is an internal fault-injection seam: it runs in the window
+// between creating a journal file and locking it, which is exactly where a
+// concurrent recovery used to steal the record. Production builds leave it nil.
+var journalCreateHook func(path string)
+
+// journalCreateAttempts bounds the retries of createLockedJournalFile. Each
+// retry needs a concurrent recovery to win the same narrow window again.
+const journalCreateAttempts = 8
+
+// createLockedJournalFile creates a journal record and takes its exclusive
+// lock, retrying on a fresh name when a concurrent recovery claimed the file
+// first.
+//
+// os.CreateTemp publishes the name before the owner can flock it. A NewStore
+// running in another process scans the journal directory, finds a record it can
+// lock and carries no complete line, and removes it as a crash leftover. The
+// owner then either failed with a bare EWOULDBLOCK ("lock replacement journal:
+// resource temporarily unavailable", which aborted an otherwise valid restore)
+// or kept writing to an unlinked inode, leaving the operation unjournalled and
+// therefore unrecoverable — the exact crash window invariant 14 exists to close.
+func createLockedJournalFile(dir, pattern string) (*os.File, error) {
+	var lastErr error
+	for attempt := 0; attempt < journalCreateAttempts; attempt++ {
+		f, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		if journalCreateHook != nil {
+			journalCreateHook(f.Name())
+		}
+		if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = f.Close()
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				// A recovery pass holds the lock and is about to remove the
+				// record; removing it here could delete a name it has already
+				// re-used. Leave it and claim a different one.
+				lastErr = err
+				continue
+			}
+			_ = os.Remove(f.Name())
+			return nil, err
+		}
+		claimed, err := journalFileStillClaimed(f)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return nil, err
+		}
+		if claimed {
+			return f, nil
+		}
+		// The record was unlinked (or its name re-used) while it was unlocked.
+		_ = f.Close()
+		lastErr = fmt.Errorf("journal record was removed by a concurrent recovery")
+	}
+	return nil, lastErr
+}
+
+// journalFileStillClaimed reports whether the locked descriptor is still the
+// file its own path names.
+func journalFileStillClaimed(f *os.File) (bool, error) {
+	var opened unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &opened); err != nil {
+		return false, err
+	}
+	if opened.Nlink == 0 {
+		return false, nil
+	}
+	var named unix.Stat_t
+	if err := unix.Stat(f.Name(), &named); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return named.Dev == opened.Dev && named.Ino == opened.Ino, nil
+}
+
 func (s *Store) beginReplacementGroup() (*replacementGroup, error) {
 	dir := s.journalDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(dir, "group-*.json")
+	f, err := createLockedJournalFile(dir, "group-*.json")
 	if err != nil {
-		return nil, err
-	}
-	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		_ = os.Remove(f.Name())
 		return nil, fmt.Errorf("lock replacement group: %w", err)
 	}
 	g := &replacementGroup{
@@ -139,13 +213,8 @@ func (s *Store) beginStaging(staging string) (*replacement, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(dir, "replace-*.json")
+	f, err := createLockedJournalFile(dir, "replace-*.json")
 	if err != nil {
-		return nil, err
-	}
-	if err := unix.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		_ = os.Remove(f.Name())
 		return nil, fmt.Errorf("lock replacement journal: %w", err)
 	}
 	published := false
@@ -294,6 +363,21 @@ func (s *Store) recoverReplacement(path string) error {
 	}
 	defer unix.Flock(int(f.Fd()), syscall.LOCK_UN)
 
+	// The owner may have completed and removed this record between the
+	// directory listing and the lock above: taking its lock then succeeds on an
+	// unlinked inode. Recovering from it is pointless, and reading it back
+	// through its path used to fail the whole NewStore with
+	// "recover interrupted volume replacement: ...: no such file or directory",
+	// so any dvol process starting up could abort because another one had just
+	// finished a restore.
+	claimed, err := journalFileStillClaimed(f)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
+	}
+
 	record, ok, err := readReplacementRecord(f)
 	if err != nil {
 		return err
@@ -438,8 +522,13 @@ func (s *Store) replacementGroupPublished(name string) (bool, error) {
 }
 
 // readReplacementRecord returns the last complete JSON line of a journal file.
+// It reads through the locked descriptor rather than re-opening the path, so
+// the record it reports is the one whose lock the caller holds.
 func readReplacementRecord(f *os.File) (replacementRecord, bool, error) {
-	data, err := os.ReadFile(f.Name())
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return replacementRecord{}, false, err
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return replacementRecord{}, false, err
 	}

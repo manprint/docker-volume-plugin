@@ -11,6 +11,8 @@ Volume data stays in Docker; dvol only owns the archives.
 AGENTS.md            # this file: architecture, invariants, quality gates
 CLAUDE.md            # symlink to AGENTS.md
 REVIEW.md            # 2026-08-08 audit; every finding has a test named after it
+QA_REVIEW_2026-08-11.md  # QA audit of the post-review code
+REVIEW_2026-09-11.md # 2026-09-11 audit: concurrency, Docker adapter, toolchain
 README.md            # user documentation (Italian)
 Specs.md
 Makefile
@@ -78,8 +80,15 @@ release blocker, not a style question.
    symlink target is read. `TestBackupNeverModifiesSource`, `source_invariant_test.go`.
 2. If the source cannot be read without updating atimes, the backup fails and
    names `--allow-atime` rather than silently touching it. `TestAtimeStrictnessAndOptIn`.
-3. The archive, its temporary file, the index and the lock never land inside a
-   source volume. `TestBackupRejectsUnsafeSourceAndDestination`.
+3. The archive, its temporary file, the index and the locks never land inside a
+   source volume, and never outside the destination either: every control file
+   dvol writes (`.dvol-index.json`, `.dvol-index.lock`, `.dvol-reserve-*.lock`,
+   `.dvol-temp.lock`, `.dvol-backup-*`) lives in the archive directory itself.
+   A destination whose parent is not writable — the ordinary shape of a mounted
+   backup share — is therefore usable.
+   `TestBackupRejectsUnsafeSourceAndDestination`,
+   `TestBackupSucceedsWhenDestinationParentIsNotWritable`,
+   `TestTemporaryArchiveLockIsNotListedAsABackup`.
 4. A source that changes while it is read never fails the backup: the header
    size wins, short reads are zero-padded, extra bytes are dropped, and the
    operator gets a warning. `TestBackupSurvivesConcurrentWriter`, `TestCopyFileEntry*`.
@@ -119,14 +128,28 @@ release blocker, not a style question.
     sticky, owner, nanosecond mtime, symlinks, hard-link *grouping*, FIFOs,
     xattrs (hence POSIX ACLs and capabilities) and holes in sparse files.
     Metadata recreation is strict by default; `BestEffortMetadata`/
-    `--best-effort-metadata` is the only explicit downgrade. `fidelity_test.go`,
-    `TestStrictMetadataFailureNeverPublishesPartialRestore`.
+    `--best-effort-metadata` is the only explicit downgrade. An extended
+    attribute is never dropped silently: a set that changes between the sizing
+    and the reading call (`ERANGE`) is retried, and one the caller may not read
+    is warned about. `fidelity_test.go`,
+    `TestStrictMetadataFailureNeverPublishesPartialRestore`,
+    `TestXattrReadRetriesWhenTheAttributeSetGrows`,
+    `TestXattrReadStillTreatsUnsupportedFilesystemsAsEmpty`.
 13. Metadata is only ever applied to entries that were actually created.
     `TestFifoRoundTrip`, `TestRestoreSkipsDeviceNodeWithoutPrivileges`.
 14. Every directory swap is journalled, so a crash inside the one non-atomic
     window is repaired by the next `NewStore` — for any target, including a
     Docker mountpoint outside the repository. Journal creation/removal and the
-    extracted filesystem are synced before publication. `journal_test.go`.
+    extracted filesystem are synced before publication. A recovery pass and a
+    record being created race for the same name: the creator retries on a fresh
+    name rather than continuing with a record that is no longer on disk, and
+    recovery ignores a record whose owner unlinked it while it was being opened.
+    Another dvol process merely starting up can therefore neither break an
+    in-flight restore nor fail itself. `journal_test.go`,
+    `TestJournalRecordSurvivesConcurrentRecoveryRemovingIt`,
+    `TestJournalRecordSurvivesConcurrentRecoveryLockingIt`,
+    `TestReplacementGroupSurvivesConcurrentRecoveryRemovingIt`,
+    `TestConcurrentStoreOpensDoNotStealInFlightJournalRecords`.
 15. A restore into a volume a running container has mounted is refused unless
     `--force`; the CLI checks both before staging and immediately before commit.
     `TestRestoreRefusesVolumeMountedByRunningContainer`,
@@ -139,8 +162,9 @@ release blocker, not a style question.
     version is fatal. `TestFlatIndexSurvivesDamagedEntry`.
 17. Concurrency is safe by construction: the index lock is short and never spans
     an archive write; an archive name is owned through a flocked reservation
-    file; journal records are flocked so recovery skips in-flight operations.
-    `concurrency_test.go`, run under `-race`.
+    file; journal records are flocked so recovery skips in-flight operations,
+    and the create-then-lock window is closed by retrying rather than by
+    continuing with a stolen record. `concurrency_test.go`, run under `-race`.
 18. CLI operations accept plain Docker `local` volumes and local bind-backed
     volumes with `type=none`, an absolute `device`, and `o=bind[,rw]`. Bind
     volumes resolve to the host device rather than Docker's transient `_data`
@@ -155,6 +179,14 @@ release blocker, not a style question.
     Lock/unlock are idempotent. `TestVolumeLockLifecycleIsIdempotent`,
     `TestDockerCLIAdapterCommandsAndParsing`, and the real-Docker lock defect
     acceptance scenario pin the contract.
+20. The Docker CLI adapter parses standard output only. Docker writes advisory
+    lines to standard error on a healthy daemon, and merging the streams put
+    them inside the JSON and the volume lists dvol decodes. Diagnostics still
+    reach the operator through the error of a failed command, and the
+    missing-volume/missing-container classification still reads them.
+    `TestDockerCLIIgnoresWarningsOnStandardError`,
+    `TestDockerCLIStillReportsStandardErrorDiagnostics`,
+    `TestDockerCLIAdapterClassifiesFailures`.
 
 ## Quality gates
 
@@ -166,6 +198,11 @@ sudo make acceptance       # every acceptance suite, both client paths
 `make check` must be clean before any commit. `sudo make acceptance` must be
 clean before anything that touches the write path, the restore path or the CLI
 contract; it needs a working Docker Engine and pulls test images.
+
+The toolchain is pinned by the `go` directive in `go.mod` (currently Go 1.27.1),
+which is also what CI feeds to `actions/setup-go` through `go-version-file`.
+Bumping it is a one-line change plus a green `make check`; do not pin a Go
+version anywhere else.
 
 | target | what it covers |
 | --- | --- |

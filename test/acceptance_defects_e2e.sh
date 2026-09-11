@@ -486,6 +486,108 @@ scenario_interrupted_restore() {
 }
 
 # ---------------------------------------------------------------------------
+# R5 (2026-09-11): the Docker CLI writes advisory lines to stderr on a healthy
+# daemon. dvol merged them into stdout and failed to parse its own output.
+# ---------------------------------------------------------------------------
+scenario_docker_stderr_warnings() {
+	echo "R5: Docker CLI warnings on stderr must not break dvol"
+	local volume shim_dir real_docker archive
+	volume="$(new_volume r5)"
+	in_volume "$volume" "printf warned > /data/marker.txt"
+
+	real_docker="$(command -v docker)"
+	shim_dir="$WORK_DIR/docker-shim"
+	mkdir -p -- "$shim_dir"
+	{
+		echo '#!/usr/bin/env bash'
+		echo 'echo "WARNING: API version negotiation failed, using default" >&2'
+		echo "exec $real_docker \"\$@\""
+	} >"$shim_dir/docker"
+	chmod +x "$shim_dir/docker"
+
+	( export PATH="$shim_dir:$PATH"
+	  dvol_cmd --root "$ARCHIVE_ROOT" list >/dev/null ) \
+		|| fail "list failed while the Docker CLI emitted a stderr warning"
+	archive="$( ( export PATH="$shim_dir:$PATH"
+	              dvol_cmd --root "$ARCHIVE_ROOT" backup "$volume" ) | sed -n 's/^backed up .* -> //p')"
+	[[ -n "$archive" ]] || fail "backup failed while the Docker CLI emitted a stderr warning"
+	in_volume "$volume" "printf changed > /data/marker.txt"
+	( export PATH="$shim_dir:$PATH"
+	  dvol_cmd --root "$ARCHIVE_ROOT" restore --force "$volume" "$archive" >/dev/null ) \
+		|| fail "restore failed while the Docker CLI emitted a stderr warning"
+	in_volume "$volume" 'test "$(cat /data/marker.txt)" = warned' \
+		|| fail "restore did not reproduce the archived content"
+	pass "backup, list and restore unaffected by Docker stderr warnings"
+}
+
+# ---------------------------------------------------------------------------
+# R1 (2026-09-11): the temporary-archive coordination lock was written to the
+# parent of the destination, outside the directory dvol was pointed at.
+# ---------------------------------------------------------------------------
+scenario_destination_control_files() {
+	echo "R1: dvol control files stay inside the destination"
+	local volume destination parent
+	volume="$(new_volume r1)"
+	in_volume "$volume" "printf payload > /data/marker.txt"
+	parent="$WORK_DIR/share"
+	destination="$parent/backups"
+	mkdir -p -- "$destination"
+
+	dvol_cmd --root "$ARCHIVE_ROOT" --destination "$destination" \
+		backup --same-destination "$volume" >/dev/null
+	dvol_cmd --root "$ARCHIVE_ROOT" --destination "$destination" backup "$volume" >/dev/null
+
+	[[ -f "$destination/.dvol-temp.lock" ]] \
+		|| fail "the temporary-archive lock is not inside the destination"
+	[[ ! -e "$parent/.dvol-temp.lock" ]] \
+		|| fail "dvol wrote its temporary-archive lock outside the destination"
+	[[ -z "$(find "$destination" -maxdepth 1 -name '.dvol-backup-*' -print -quit)" ]] \
+		|| fail "a temporary archive was left behind"
+	pass "control files confined to the destination directory"
+
+	# The lock must never be mistaken for a backup.
+	dvol_cmd --root "$ARCHIVE_ROOT" --destination "$destination" backups "$volume" \
+		| grep -q '\.dvol-temp\.lock' && fail "the coordination lock is listed as a backup"
+	pass "the coordination lock is not listed as a backup"
+}
+
+# ---------------------------------------------------------------------------
+# R3/R4 (2026-09-11): another dvol process merely starting up opened the
+# replacement journal of an in-flight restore, and either stole its record or
+# aborted with "recover interrupted volume replacement: no such file or
+# directory".
+# ---------------------------------------------------------------------------
+scenario_concurrent_store_opens() {
+	echo "R3/R4: concurrent dvol invocations must not disturb a running restore"
+	local volume archive log pid status
+	volume="$(new_volume r3)"
+	in_volume "$volume" "printf original > /data/marker.txt; dd if=/dev/urandom of=/data/payload.bin bs=1M count=96 2>/dev/null"
+	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression lz4 "$volume" | sed -n 's/^backed up .* -> //p')"
+	in_volume "$volume" "printf live > /data/marker.txt"
+	log="$WORK_DIR/concurrent-opens.log"
+
+	(
+		for _ in $(seq 1 40); do
+			dvol_cmd --root "$ARCHIVE_ROOT" backups "$volume" >/dev/null 2>>"$log" || echo "backups failed" >>"$log"
+		done
+	) &
+	pid=$!
+	set +e
+	dvol_cmd --root "$ARCHIVE_ROOT" restore --force "$volume" "$archive" >/dev/null 2>>"$log"
+	status=$?
+	set -e
+	wait "$pid"
+	[[ $status -eq 0 ]] || fail "the restore failed while other dvol processes were opening the store"
+	if [[ -s "$log" ]] && grep -qE 'replacement journal|interrupted volume replacement|backups failed' "$log"; then
+		cat "$log" >&2
+		fail "a concurrent store open disturbed the in-flight restore"
+	fi
+	in_volume "$volume" 'test "$(cat /data/marker.txt)" = original' \
+		|| fail "the restore did not publish the archived content"
+	pass "restore unaffected by 40 concurrent store opens"
+}
+
+# ---------------------------------------------------------------------------
 # Fidelity: metadata, xattrs, sparse files and sub-second timestamps.
 # ---------------------------------------------------------------------------
 scenario_fidelity() {
@@ -588,6 +690,9 @@ main() {
 	scenario_volume_lock
 	scenario_volume_in_use
 	scenario_interrupted_restore
+	scenario_docker_stderr_warnings
+	scenario_destination_control_files
+	scenario_concurrent_store_opens
 	scenario_fidelity
 	scenario_verify
 	echo "All defect acceptance scenarios passed"
