@@ -695,6 +695,24 @@ func TestDockerCLIStillReportsStandardErrorDiagnostics(t *testing.T) {
 	}
 }
 
+// A Docker command that fails without a word on either stream used to be
+// reported as "exit status 1: ", a dangling separator in front of nothing.
+func TestDockerCLIErrorWithoutDiagnosticsHasNoTrailingSeparator(t *testing.T) {
+	command := filepath.Join(t.TempDir(), "docker")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cli := &dockerCLI{command: command}
+	_, err := cli.run("volume", "ls")
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v, want the wrapped *exec.ExitError", err)
+	}
+	if strings.HasSuffix(strings.TrimSpace(err.Error()), ":") {
+		t.Fatalf("error %q ends with a dangling separator", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 2026-09-11 review — R6: `backup --bundle --same-destination` accepted the
 // flag and ignored it. The bundle went to <destination>/compose while the

@@ -93,6 +93,9 @@ func (c *dockerCLI) run(args ...string) ([]byte, error) {
 		if details == "" {
 			details = strings.TrimSpace(stdout.String())
 		}
+		if details == "" {
+			return stdout.Bytes(), err
+		}
 		return stdout.Bytes(), fmt.Errorf("%w: %s", err, details)
 	}
 	return stdout.Bytes(), nil
