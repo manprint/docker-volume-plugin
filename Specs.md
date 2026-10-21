@@ -75,7 +75,7 @@ profili Compose: per quei casi occorre passare l’output materializzato di
 
 ## Toolchain
 
-Go 1.27.1, fissato dalla direttiva `go` in `go.mod` e usato anche dalla CI
+Go 1.27.3, fissato dalla direttiva `go` in `go.mod` e usato anche dalla CI
 tramite `go-version-file`. Dipendenze dirette: `klauspost/compress`,
 `klauspost/pgzip`, `pierrec/lz4/v4`, `ulikunitz/xz`, `golang.org/x/sys`,
 `gopkg.in/yaml.v3`.

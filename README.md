@@ -19,7 +19,7 @@ volumi creati prima dell’installazione.
 
 - Linux, Docker Engine locale e Docker CLI 19.03 o superiore sull’host che
   esegue il comando;
-- Go 1.27.1 o superiore per compilare il progetto (la versione è fissata dalla
+- Go 1.27.3 o superiore per compilare il progetto (la versione è fissata dalla
   direttiva `go` in `go.mod` e usata anche dalla CI);
 - permessi di lettura/scrittura sul mountpoint Docker;
 - volumi con driver `local` normali oppure bind-backed con opzioni

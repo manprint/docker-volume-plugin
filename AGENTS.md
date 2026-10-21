@@ -199,7 +199,7 @@ sudo make acceptance       # every acceptance suite, both client paths
 clean before anything that touches the write path, the restore path or the CLI
 contract; it needs a working Docker Engine and pulls test images.
 
-The toolchain is pinned by the `go` directive in `go.mod` (currently Go 1.27.1),
+The toolchain is pinned by the `go` directive in `go.mod` (currently Go 1.27.3),
 which is also what CI feeds to `actions/setup-go` through `go-version-file`.
 Bumping it is a one-line change plus a green `make check`; do not pin a Go
 version anywhere else.
