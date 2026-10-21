@@ -36,6 +36,11 @@ cleanup() {
 	for volume in "${CREATED_VOLUMES[@]}"; do
 		docker volume rm -f "$volume" >/dev/null 2>&1
 	done
+	# new_volume runs in a command substitution, so its CREATED_VOLUMES entry
+	# never reaches this shell; the per-run name prefix finds those volumes.
+	docker volume ls -q | grep "^dvol_${TAG}_" | while IFS= read -r volume; do
+		docker volume rm -f "$volume" >/dev/null 2>&1
+	done
 	rm -rf -- "$WORK_DIR"
 }
 trap cleanup EXIT
@@ -450,18 +455,32 @@ YAML
 # ---------------------------------------------------------------------------
 scenario_interrupted_restore() {
 	echo "H6: restore killed mid-flight is repaired on the next run"
-	local volume archive mountpoint status
+	local volume archive mountpoint status delay
 	volume="$(new_volume h6)"
 	in_volume "$volume" "printf original > /data/marker.txt; dd if=/dev/urandom of=/data/payload.bin bs=1M count=192 2>/dev/null"
 	archive="$(dvol_cmd --root "$ARCHIVE_ROOT" backup --compression lz4 "$volume" | sed -n 's/^backed up .* -> //p')"
-	in_volume "$volume" "printf live > /data/marker.txt"
 	mountpoint="$(mountpoint_of "$volume")"
 
-	set +e
-	timeout -s KILL 1 "$DVOL_BIN" --root "$ARCHIVE_ROOT" restore --force "$volume" "$archive" >/dev/null 2>&1
-	status=$?
-	set -e
-	echo "  interrupted restore exited with $status"
+	# Without --foreground GNU timeout sends the signal to its whole process
+	# group: SIGKILL takes timeout down with dvol and the shell resumes while dvol
+	# is still exiting. A thread blocked in syncfs keeps the journal record
+	# flocked, so the recovery below rightly treats it as in flight and the
+	# staging directory survives until a later run. With --foreground timeout
+	# kills dvol alone and reaps it, and the lock is gone before recovery starts.
+	#
+	# A fast host finishes the restore before the deadline, which tests nothing,
+	# so the deadline shrinks until a kill actually lands.
+	status=0
+	for delay in 1 0.5 0.25 0.1 0.05; do
+		in_volume "$volume" "printf live > /data/marker.txt"
+		set +e
+		timeout --foreground -s KILL "$delay" "$DVOL_BIN" --root "$ARCHIVE_ROOT" restore --force "$volume" "$archive" >/dev/null 2>&1
+		status=$?
+		set -e
+		[[ "$status" == 0 ]] || break
+	done
+	echo "  interrupted restore exited with $status after ${delay}s"
+	[[ "$status" == 137 ]] || fail "no restore attempt was interrupted (last exit status $status)"
 
 	# Whatever the moment of the kill, the volume must still have a data
 	# directory holding one of the two coherent states.
